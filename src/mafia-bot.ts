@@ -1,6 +1,20 @@
 import TelegramBot from 'node-telegram-bot-api';
-import path from 'path';
 import dotenv from 'dotenv';
+import {
+    DEFAULT_PLAYERS_COUNT,
+    DEFAULT_MAFIA_COUNT,
+    GAME_STATUS,
+    MESSAGES,
+    ROLES,
+    Role,
+    GameStatus,
+    Player,
+    Game,
+    ROLE_IMAGES,
+    shuffleArray,
+    generateRoles,
+    checkWinCondition,
+} from './util';
 dotenv.config();
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -12,37 +26,7 @@ if (!BOT_TOKEN) {
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-interface Player {
-    id: number;
-    name: string;
-    role: string | null;
-    isAlive: boolean;
-    order: number;
-    revealed: boolean;
-}
 
-interface Game {
-    id: string;
-    ownerId: number;
-    ownerName: string;
-    players: Player[];
-    maxPlayers: number;
-    maxMafia: number;
-    status: 'waiting' | 'active' | 'ended';
-    lastRevealChatId?: number;
-    lastRevealMessageId?: number;
-}
-
-export const ROLE_IMAGES: Record<string, string> = {
-    'Mafia Don': path.join(__dirname, '../assets/don.png'),
-    'Mafia': path.join(__dirname, '../assets/mafia.png'),
-    'Sheriff': path.join(__dirname, '../assets/sheriff.png'),
-    'Doctor': path.join(__dirname, '../assets/doc.png'),
-    'Civilian': path.join(__dirname, '../assets/civilian.png'),
-};
-
-const DEFAULT_PLAYERS_COUNT = 11;
-const DEFAULT_MAFIA_COUNT = 3;
 
 const games = new Map<string, Game>();
 const userGames = new Map<number, string>();
@@ -57,40 +41,11 @@ const randomizeGame = (game: Game) => {
     }));
 };
 
-const shuffleArray = <T>(array: T[]) => {
-    const result = [...array];
-    for (let i = result.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [result[i], result[j]] = [result[j], result[i]];
-    }
-    return result;
-};
-
-const generateRoles = (playersTotal: number, mafiaTotal: number) => {
-    const roles: string[] = ['Mafia Don'];
-    for (let i = 1; i < mafiaTotal; i++) {
-        roles.push('Mafia');
-    }
-    roles.push('Sheriff', 'Doctor');
-    while (roles.length < playersTotal) {
-        roles.push('Civilian');
-    }
-    return shuffleArray(roles);
-};
-
-const checkWinCondition = (game: Game) => {
-    const alivePlayers = game.players.filter(p => p.isAlive);
-    const aliveMafia = alivePlayers.filter(p => p.role === 'Mafia' || p.role === 'Mafia Don');
-    const aliveCivilians = alivePlayers.filter(p => p.role !== 'Mafia' && p.role !== 'Mafia Don');
-    if (aliveMafia.length === 0) return 'Civilians';
-    if (aliveMafia.length >= aliveCivilians.length) return 'Mafia';
-    return null;
-};
 
 const endGame = (game: Game, winner: string) => {
-    game.status = 'ended';
+    game.status = GAME_STATUS.ENDED;
     const activeNonCivilians = game.players
-        .filter(p => p.role !== 'Civilian')
+        .filter(p => p.role !== ROLES.CIVILIAN)
         .map(p => `${p.name}: ${p.role}`)
         .join('\n');
     const message = `🏆 ${winner} win!\n\n📜 Active Roles:\n${activeNonCivilians}`;
@@ -109,7 +64,7 @@ bot.onText(/\/abortgame$/, (msg) => {
     if (!userId) return;
     if (userGames.has(userId)) {
         const existingGameId = userGames.get(userId)!;
-        if (games.get(existingGameId)?.ownerId !== userId) return bot.sendMessage(msg.chat.id, '❌ Not authorized!');
+        if (games.get(existingGameId)?.ownerId !== userId) return bot.sendMessage(msg.chat.id, `${MESSAGES.NOT_AUTHORIZED_CHAT}`);
         games.delete(existingGameId);
         userGames.delete(userId);
         return bot.sendMessage(msg.chat.id, 'Game was aborted!');
@@ -122,7 +77,7 @@ bot.onText(/\/creategame(?:\s+(\d+)\s+(\d+))?$/, (msg, match) => {
     if (userGames.has(userId)) {
         const existingGameId = userGames.get(userId)!;
         const existingGame = games.get(existingGameId);
-        if (existingGame && existingGame.status !== 'ended') {
+        if (existingGame && existingGame.status !== GAME_STATUS.ENDED) {
             return bot.sendMessage(msg.chat.id, '❌ You are already in an active game!');
         }
         userGames.delete(userId);
@@ -138,7 +93,7 @@ bot.onText(/\/creategame(?:\s+(\d+)\s+(\d+))?$/, (msg, match) => {
         players: [],
         maxPlayers,
         maxMafia,
-        status: 'waiting',
+        status: GAME_STATUS.WAITING,
     };
     games.set(gameId, newGame);
     userGames.set(userId, gameId);
@@ -159,7 +114,7 @@ const handleJoin = (msg: TelegramBot.Message, match:RegExpExecArray | null) => {
     if (!game) return bot.sendMessage(chatId, '❌ Game not found!');
 
     if (game.ownerId === userId) return bot.sendMessage(chatId, '❌ Game owner cannot join their own game!');
-    if (game.status === 'ended') return bot.sendMessage(chatId, '❌ Cannot join an ended game!');
+    if (game.status === GAME_STATUS.ENDED) return bot.sendMessage(chatId, '❌ Cannot join an ended game!');
     if (game.players.length >= game.maxPlayers) return bot.sendMessage(chatId, '❌ Game full!');
     if (game.players.some(p => p.id === userId)) {
         return bot.sendMessage(chatId, '❌ Already joined!');
@@ -187,7 +142,7 @@ bot.onText(/\/startgame$/, msg => {
         return bot.sendMessage(msg.chat.id, `❌ Need ${game.maxPlayers} players (excluding owner) to start!`);
     }
     randomizeGame(game);
-    game.status = 'active';
+    game.status = GAME_STATUS.ACTIVE;
     bot.sendMessage(msg.chat.id, '🎲 Roles assigned. Use /dashboard to reveal roles and manage the game.');
 });
 
@@ -196,11 +151,11 @@ bot.onText(/\/dashboard$/, msg => {
     const gameId = userGames.get(userId!);
     if (!gameId) return bot.sendMessage(msg.chat.id, '❌ No game found!');
     const game = games.get(gameId)!;
-    if (game.ownerId !== userId) return bot.sendMessage(msg.chat.id, '❌ Not authorized!');
-    if (game.status === 'ended') return bot.sendMessage(msg.chat.id, '⚠️ Game has ended.');
+    if (game.ownerId !== userId) return bot.sendMessage(msg.chat.id, `${MESSAGES.NOT_AUTHORIZED_CHAT}`);
+    if (game.status === GAME_STATUS.ENDED) return bot.sendMessage(msg.chat.id, '⚠️ Game has ended.');
     const anyUnrevealed = game.players.some(p => !p.revealed);
     const keyboard: Array<Array<{ text: string; callback_data: string }>> = [];
-    if (game.status === 'waiting') {
+    if (game.status === GAME_STATUS.WAITING) {
         keyboard.push([{ text: '🚀 Start Game', callback_data: `startgame_${gameId}` }]);
     } else if (anyUnrevealed) {
         game.players.forEach(p => {
@@ -219,7 +174,7 @@ bot.onText(/\/dashboard$/, msg => {
     if (game.lastRevealChatId && game.lastRevealMessageId) {
         bot.deleteMessage(game.lastRevealChatId, game.lastRevealMessageId);
     }
-    if (!anyUnrevealed && game.status === 'active') {
+    if (!anyUnrevealed && game.status === GAME_STATUS.ACTIVE) {
         dashboardText += '\n\n<b>Players with Roles:</b>';
         game.players.forEach(p => {
             dashboardText += `\n${p.order}. ${p.name} - ${p.role} ${p.isAlive ? '💚' : '💀'}`;
@@ -238,17 +193,17 @@ bot.on('callback_query', async cb => {
     if (!game) return;
     switch (action) {
         case 'startgame': {
-            if (game.ownerId !== cb.from.id) return bot.answerCallbackQuery(cb.id, { text: 'Not authorized!' });
+            if (game.ownerId !== cb.from.id) return bot.answerCallbackQuery(cb.id, { text: MESSAGES.NOT_AUTHORIZED });
             if (game.players.length !== game.maxPlayers) return bot.answerCallbackQuery(cb.id, { text: `Need ${game.maxPlayers} players to start!` });
             randomizeGame(game);
-            game.status = 'active';
+            game.status = GAME_STATUS.ACTIVE;
             bot.sendMessage(cb.message!.chat.id, '🎲 Roles assigned. Refresh dashboard to proceed.');
             bot.answerCallbackQuery(cb.id);
             break;
         }
         case 'reveal': {
             const targetId = Number(userIdStr);
-            if (game.ownerId !== cb.from.id) return bot.answerCallbackQuery(cb.id, { text: 'Not authorized!' });
+            if (game.ownerId !== cb.from.id) return bot.answerCallbackQuery(cb.id, { text: MESSAGES.NOT_AUTHORIZED });
             const player = game.players.find(p => p.id === targetId);
             if (!player || !player.role) return;
             player.revealed = true;
@@ -267,7 +222,7 @@ bot.on('callback_query', async cb => {
         }
         case 'eliminateconfirm': {
             const targetId = Number(userIdStr);
-            if (game.ownerId !== cb.from.id) return bot.answerCallbackQuery(cb.id, { text: 'Not authorized!' });
+            if (game.ownerId !== cb.from.id) return bot.answerCallbackQuery(cb.id, { text: MESSAGES.NOT_AUTHORIZED });
             const confirmKeyboard = {
                 inline_keyboard: [[
                     { text: '✅ Yes', callback_data: `eliminate_${gameId}_${targetId}` },
@@ -281,7 +236,7 @@ bot.on('callback_query', async cb => {
         }
         case 'eliminate': {
             const targetId = Number(userIdStr);
-            if (game.ownerId !== cb.from.id) return bot.answerCallbackQuery(cb.id, { text: 'Not authorized!' });
+            if (game.ownerId !== cb.from.id) return bot.answerCallbackQuery(cb.id, { text: MESSAGES.NOT_AUTHORIZED });
             const player = game.players.find(p => p.id === targetId);
             if (!player || !player.isAlive) return;
             player.isAlive = false;
