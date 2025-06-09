@@ -262,6 +262,7 @@ bot.on('callback_query', async cb => {
             const sentMsg = await bot.sendPhoto(cb.message!.chat.id, roleImage, { caption: `🎭 ${player.name} is ${player.role}` });
             game.lastRevealChatId = sentMsg.chat.id;
             game.lastRevealMessageId = sentMsg.message_id;
+            await bot.sendPhoto(player.id, roleImage, { caption: `🎭 Your role is ${player.role}` });
             bot.answerCallbackQuery(cb.id);
             break;
         }
