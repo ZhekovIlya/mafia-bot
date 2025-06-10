@@ -26,6 +26,24 @@ export const MESSAGES = {
   NOT_AUTHORIZED_CHAT: '❌ Not authorized!',
 };
 
+export const START_HINT =
+  'Welcome to Mafia Game Bot! Send /help for commands and game rules.';
+
+export const HELP_TEXT =
+  '📖 Commands:\n' +
+  '/creategame [players] [mafia] - create a new game (defaults 11 players, 3 mafia). You become the owner.\n' +
+  '/joingame <gameId> - join an existing game or use a join link.\n' +
+  '\nWhen enough players join, open /dashboard to begin. Roles are sent when the game starts.\n' +
+  'Mafia eliminate others while civilians try to expose them.';
+
+export const OWNER_HELP_TEXT =
+  '\n<b>Owner Tips</b>\n' +
+  'Single command to manage whole game:\n/dashboard\n' +
+  '\nAdvanced commands:\n' +
+  '/startgame - start the game manually\n' +
+  '/abortgame - cancel your current game';
+
+
 export interface Player {
   id: number;
   name: string;

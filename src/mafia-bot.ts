@@ -5,6 +5,9 @@ import {
     DEFAULT_MAFIA_COUNT,
     GAME_STATUS,
     MESSAGES,
+    START_HINT,
+    HELP_TEXT,
+    OWNER_HELP_TEXT,
     ROLES,
     Role,
     GameStatus,
@@ -56,7 +59,19 @@ const endGame = (game: Game, winner: string) => {
 };
 
 bot.onText(/\/start$/, msg => {
-    bot.sendMessage(msg.chat.id, `🎭 Welcome to Mafia Game Bot!\n\nCommands:\n/creategame [numPlayers] - Create a game with optional player count\n/joingame [gameId] - Join a game\n/startgame - Assign roles and start (owner only)\n/dashboard - Reveal roles & manage game (owner only)`);
+    bot.sendMessage(msg.chat.id, START_HINT);
+});
+
+bot.onText(/\/help$/, msg => {
+    const userId = msg.from?.id;
+    bot.sendMessage(msg.chat.id, HELP_TEXT);
+    if (!userId) return;
+    const existingGameId = userGames.get(userId);
+    if (!existingGameId) return;
+    const game = games.get(existingGameId);
+    if (game?.ownerId === userId) {
+        bot.sendMessage(msg.chat.id, OWNER_HELP_TEXT);
+    }
 });
 
 bot.onText(/\/abortgame$/, (msg) => {
@@ -101,6 +116,7 @@ bot.onText(/\/creategame(?:\s+(\d+)\s+(\d+))?$/, (msg, match) => {
     bot.sendMessage(msg.chat.id, `🎮 Game created! Game ID: ${gameId}\nMax Players: ${maxPlayers}\nMax Mafia: ${maxMafia}\nJoin link: ${joinLink}`, {
         reply_markup: { inline_keyboard: [[{ text: 'Join Game', url: joinLink }]] }
     });
+    bot.sendMessage(msg.chat.id, OWNER_HELP_TEXT);
 });
 
 const handleJoin = (msg: TelegramBot.Message, match:RegExpExecArray | null) => {
