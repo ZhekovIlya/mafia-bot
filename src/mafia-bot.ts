@@ -174,6 +174,7 @@ bot.onText(/\/dashboard$/, msg => {
     if (game.status === GAME_STATUS.WAITING) {
         keyboard.push([{ text: '🚀 Start Game', callback_data: `startgame_${gameId}` }]);
     } else if (anyUnrevealed) {
+        keyboard.push([{ text: '🔓 Reveal All', callback_data: `revealall_${gameId}` }]);
         game.players.forEach(p => {
             const revealData = `reveal_${gameId}_${p.id}`;
             keyboard.push([{ text: `🎭 Reveal ${p.order}. ${p.name}`, callback_data: revealData }]);
@@ -234,6 +235,32 @@ bot.on('callback_query', async cb => {
             game.lastRevealChatId = sentMsg.chat.id;
             game.lastRevealMessageId = sentMsg.message_id;
             await bot.sendPhoto(player.id, roleImage, { caption: `🎭 Your role is ${player.role}` });
+            bot.answerCallbackQuery(cb.id);
+            break;
+        }
+        case 'revealall': {
+            if (game.ownerId !== cb.from.id) return bot.answerCallbackQuery(cb.id, { text: MESSAGES.NOT_AUTHORIZED });
+            const unrevealed = game.players.filter(p => !p.revealed);
+            if (unrevealed.length === 0) {
+                bot.answerCallbackQuery(cb.id);
+                break;
+            }
+            if (game.lastRevealChatId && game.lastRevealMessageId) {
+                try {
+                    await bot.deleteMessage(game.lastRevealChatId, game.lastRevealMessageId);
+                } catch {
+                }
+            }
+            unrevealed.forEach(p => {
+                p.revealed = true;
+            });
+            await Promise.all(
+                unrevealed.map(p => {
+                    if (!p.role) return Promise.resolve();
+                    return bot.sendPhoto(p.id, ROLE_IMAGES[p.role], { caption: `🎭 Your role is ${p.role}` });
+                })
+            );
+            await bot.sendMessage(cb.message!.chat.id, '🎭 All roles have been revealed.');
             bot.answerCallbackQuery(cb.id);
             break;
         }
