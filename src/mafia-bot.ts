@@ -122,6 +122,7 @@ bot.onText(/\/creategame(?:\s+(\d+)\s+(\d+))?$/, (msg, match) => {
 const handleJoin = (msg: TelegramBot.Message, match:RegExpExecArray | null) => {
     const userId = msg.from?.id;
     const userName = msg.from?.first_name || 'Player';
+    const userUsername = msg.from?.username;
     const chatId = msg.chat.id;
     if (!userId) return;
 
@@ -135,7 +136,7 @@ const handleJoin = (msg: TelegramBot.Message, match:RegExpExecArray | null) => {
     if (game.players.some(p => p.id === userId)) {
         return bot.sendMessage(chatId, '❌ Already joined!');
     }
-    game.players.push({ id: userId, name: userName, role: null, isAlive: true, order: game.players.length, revealed: false });
+    game.players.push({ id: userId, name: userName, username: userUsername, role: null, isAlive: true, order: game.players.length, revealed: false });
     userGames.set(userId, gameId);
     bot.sendMessage(chatId, '✅ Joined successfully!');
     bot.sendMessage(game.ownerId, `🎯 ${userName} joined! (${game.players.length}/${game.maxPlayers})`);
@@ -260,6 +261,21 @@ bot.on('callback_query', async cb => {
                     return bot.sendPhoto(p.id, ROLE_IMAGES[p.role], { caption: `🎭 Your role is ${p.role}` });
                 })
             );
+
+            const mafiaPlayers = game.players.filter(
+                p => p.role === ROLES.MAFIA || p.role === ROLES.DON,
+            );
+            const mafiaNames = mafiaPlayers
+                .map(p =>
+                    `${p.name}${p.username ? ` (@${p.username})` : ''}`,
+                )
+                .join(', ');
+            await Promise.all(
+                mafiaPlayers.map(p =>
+                    bot.sendMessage(p.id, `🤝 Mafia teammates: ${mafiaNames}`),
+                ),
+            );
+
             await bot.sendMessage(cb.message!.chat.id, '🎭 All roles have been revealed.');
             bot.answerCallbackQuery(cb.id);
             break;
