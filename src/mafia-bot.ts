@@ -265,15 +265,20 @@ bot.on('callback_query', async cb => {
             const mafiaPlayers = game.players.filter(
                 p => p.role === ROLES.MAFIA || p.role === ROLES.DON,
             );
-            const mafiaNames = mafiaPlayers
-                .map(p =>
-                    `${p.name}${p.username ? ` (@${p.username})` : ''}`,
-                )
-                .join(', ');
             await Promise.all(
-                mafiaPlayers.map(p =>
-                    bot.sendMessage(p.id, `🤝 Mafia teammates: ${mafiaNames}`),
-                ),
+                mafiaPlayers.map(player => {
+                    const teammates = mafiaPlayers
+                        .filter(p => p.id !== player.id)
+                        .map(
+                            p =>
+                                `${p.name}${p.username ? ` (@${p.username})` : ''} - ${p.role}`,
+                        )
+                        .join(', ');
+                    return bot.sendMessage(
+                        player.id,
+                        `🤝 Mafia teammates: ${teammates}`,
+                    );
+                }),
             );
 
             await bot.sendMessage(cb.message!.chat.id, '🎭 All roles have been revealed.');
