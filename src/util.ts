@@ -47,6 +47,7 @@ export const OWNER_HELP_TEXT =
 export interface Player {
   id: number;
   name: string;
+  username?: string;
   role: Role | null;
   isAlive: boolean;
   order: number;
