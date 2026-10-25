@@ -39,5 +39,19 @@ npm run build
 npm start
 ```
 
-The repository also includes a GitHub Actions workflow in `.github/workflows/node.yml` that installs dependencies and builds the project on each push to `main`.
+## Hosting (free)
+
+**On your Windows PC:** install [Node.js](https://nodejs.org), then double-click `start-bot.bat`.
+The first run asks for the token and username and saves them to `.env`. The bot runs (and auto-restarts) while the window is open.
+
+**24/7 on a free cloud VM** (Oracle Cloud Always Free or Google Cloud e2-micro, Ubuntu):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ZhekovIlya/mafia-bot/main/deploy/setup-vm.sh | bash
+```
+
+It installs Node, builds the bot and runs it as a systemd service (restarts on crash and on reboot).
+Logs: `journalctl -u mafia-bot -f`. Update: `cd ~/mafia-bot && git pull && npm ci && npm run build && sudo systemctl restart mafia-bot`.
+
+The GitHub Actions workflow in `.github/workflows/node.yml` only checks that the project builds; GitHub does not allow Actions to be used as bot hosting.
 
