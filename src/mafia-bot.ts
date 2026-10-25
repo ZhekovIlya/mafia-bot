@@ -323,4 +323,8 @@ bot.on('callback_query', async cb => {
 
 bot.on('polling_error', console.error);
 
+// A failed send (e.g. a player blocked the bot) must not crash the whole bot.
+process.on('unhandledRejection', err => console.error('Unhandled rejection:', err));
+process.on('uncaughtException', err => console.error('Uncaught exception:', err));
+
 console.log('🎭 Mafia Bot Running');
