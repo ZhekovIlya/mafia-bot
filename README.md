@@ -44,6 +44,9 @@ npm start
 **On your Windows PC:** install [Node.js](https://nodejs.org), then double-click `start-bot.bat`.
 The first run asks for the token and username and saves them to `.env`. The bot runs (and auto-restarts) while the window is open.
 
+To run it hidden in the background every time you log in, double-click `install-autostart.bat` (after the first run above).
+Stop it with `stop-bot.bat`, remove autostart with `uninstall-autostart.bat`. Output goes to `bot.log`.
+
 **24/7 on a free cloud VM** (Oracle Cloud Always Free or Google Cloud e2-micro, Ubuntu):
 
 ```bash
