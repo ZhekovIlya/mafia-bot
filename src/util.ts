@@ -1,5 +1,3 @@
-import path from 'path';
-
 export const DEFAULT_PLAYERS_COUNT = 11;
 export const DEFAULT_MAFIA_COUNT = 3;
 
@@ -66,13 +64,6 @@ export interface Game {
   lastRevealMessageId?: number;
 }
 
-export const ROLE_IMAGES: Record<Role, string> = {
-  [ROLES.DON]: path.join(__dirname, '../assets/don.png'),
-  [ROLES.MAFIA]: path.join(__dirname, '../assets/mafia.png'),
-  [ROLES.SHERIFF]: path.join(__dirname, '../assets/sheriff.png'),
-  [ROLES.DOCTOR]: path.join(__dirname, '../assets/doc.png'),
-  [ROLES.CIVILIAN]: path.join(__dirname, '../assets/civilian.png'),
-};
 
 export const shuffleArray = <T>(array: T[]): T[] => {
   const result = [...array];

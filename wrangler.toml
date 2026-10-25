@@ -1,0 +1,12 @@
+# Cloudflare Workers deployment (free plan). Secrets BOT_TOKEN, BOT_USERNAME and WEBHOOK_SECRET are set with `wrangler secret put`.
+name = "mafia-bot"
+main = "worker/index.ts"
+compatibility_date = "2025-09-01"
+
+[[durable_objects.bindings]]
+name = "GAMES"
+class_name = "Games"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Games"]

@@ -13,12 +13,20 @@ import {
     GameStatus,
     Player,
     Game,
-    ROLE_IMAGES,
     shuffleArray,
     generateRoles,
     checkWinCondition,
 } from './util';
+import path from 'path';
 dotenv.config();
+
+const ROLE_IMAGES: Record<Role, string> = {
+    [ROLES.DON]: path.join(__dirname, '../assets/don.png'),
+    [ROLES.MAFIA]: path.join(__dirname, '../assets/mafia.png'),
+    [ROLES.SHERIFF]: path.join(__dirname, '../assets/sheriff.png'),
+    [ROLES.DOCTOR]: path.join(__dirname, '../assets/doc.png'),
+    [ROLES.CIVILIAN]: path.join(__dirname, '../assets/civilian.png'),
+};
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const BOT_USERNAME = process.env.BOT_USERNAME;
