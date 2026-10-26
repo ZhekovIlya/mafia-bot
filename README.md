@@ -65,7 +65,7 @@ The host announces a game days ahead; anyone can tap **I'm in** (no cap) and the
 - `/creategame [title]` (private chat), e.g. `/creategame Friday 20:00`. The bot replies with the lobby plus a **Share to a chat** button.
 - Or type `@your_bot Friday 20:00` in any chat (the bot does not need to be a member) and pick the result to post the lobby there.
 - Players tap **I'm in** / **Can't make it** (or send `/leave`). A player who never started the bot is sent to the bot first so it can DM their role.
-- `/dashboard` while waiting: remove players, **Lock & deal** (pick the mafia count, then deal). After that the usual reveal / eliminate flow applies.
+- `/dashboard` sends one live dashboard message that updates itself (remove players, **Lock & deal**, reveal, eliminate with in-place Yes/No confirmation). Re-sending `/dashboard` replaces it with a fresh one.
 
 ### One-time BotFather setup (required for the lobby)
 
@@ -83,3 +83,14 @@ curl "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
   -d 'allowed_updates=["message","callback_query","inline_query","chosen_inline_result"]'
 ```
 
+
+## Testing with few accounts
+
+You can play a full game with just two Telegram accounts by adding fake test players (admins only):
+
+1. Find your Telegram id: send `/addtest` to the bot once, it replies with your id. Then set it: Worker `npx wrangler secret put ADMIN_IDS` (comma-separated ids), Node: `ADMIN_IDS=123456789` in `.env`.
+2. `/creategame Test night` (host account), then have the other phone tap **I'm in**.
+3. `/addtest 3` adds `🤖 Test 1..3` (`/cleartest` removes them). Test players count like normal players but are never messaged.
+4. `/dashboard` once → **Lock & deal** → **Deal roles** → **Reveal All**, then play, all on the same message. Test players' roles are shown to the host in the dashboard and on single **Reveal**.
+
+`npm run simulate` runs the whole flow against the Worker code with a mocked Telegram API (no network, no tokens) and exits non-zero on failure.

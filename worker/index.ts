@@ -19,16 +19,26 @@ import {
     hostedOpenGame,
     renderLobby,
     lobbyKeyboard,
-    renderPanel,
-    renderConfirm,
+    renderDashboard,
+    teammatesText,
     suggestMafia,
     validateSetup,
+    playerLabel,
+    fullName,
+    refreshIdentity,
+    parseAdminIds,
+    clampTestCount,
+    isTestId,
+    addTestPlayers,
+    clearTestPlayers,
 } from '../src/util';
 
 interface Env {
     BOT_TOKEN: string;
     BOT_USERNAME: string;
     WEBHOOK_SECRET: string;
+    // Comma-separated Telegram user ids allowed to use /addtest (set with `wrangler secret put ADMIN_IDS`)
+    ADMIN_IDS?: string;
     GAMES: DurableObjectNamespace;
 }
 
@@ -115,11 +125,18 @@ export class Games {
         }
     }
 
-    private send(chatId: number, text: string, extra: Record<string, unknown> = {}) {
+    // Fake test players have no Telegram chat: never message them.
+    private isTest(id: number) {
+        return isTestId(this.games.values(), id);
+    }
+
+    private async send(chatId: number, text: string, extra: Record<string, unknown> = {}) {
+        if (this.isTest(chatId)) return null;
         return this.tg('sendMessage', { chat_id: chatId, text, ...extra });
     }
 
-    private sendPhoto(chatId: number, photo: string, caption: string) {
+    private async sendPhoto(chatId: number, photo: string, caption: string) {
+        if (this.isTest(chatId)) return null;
         return this.tg('sendPhoto', { chat_id: chatId, photo, caption });
     }
 
@@ -127,18 +144,25 @@ export class Games {
         return this.tg('answerCallbackQuery', { callback_query_id: cbId, text, ...extra });
     }
 
-    // Edits a plain-text owner panel message in place.
-    private editPanel(cb: any, view: { text: string; keyboard: Keyboard }) {
-        return this.tg('editMessageText', {
-            chat_id: cb.message.chat.id,
-            message_id: cb.message.message_id,
+    // Edits the one live dashboard message to the current state. No dashboard stored: nothing to do.
+    // Failed edits (including "message is not modified") are logged by tg() and never break the flow.
+    private async refreshDashboard(game: Game) {
+        const d = game.dashboard;
+        if (!d?.messageId) return;
+        const view = renderDashboard(game);
+        await this.tg('editMessageText', {
+            chat_id: d.chatId,
+            message_id: d.messageId,
             text: view.text,
+            parse_mode: 'HTML',
             reply_markup: { inline_keyboard: view.keyboard },
         });
     }
 
-    // Re-renders every lobby message of a game; failed edits are logged by tg() and never break the flow.
+    // Re-renders every lobby message of a game (and the live dashboard, whose waiting-phase panel
+    // lists the same players); failed edits are logged by tg() and never break the flow.
     private async refreshLobby(game: Game) {
+        await this.refreshDashboard(game);
         const base = { text: renderLobby(game), parse_mode: 'HTML' };
         await Promise.all([
             ...(game.lobbyMessages ?? []).map(m => this.tg('editMessageText', {
@@ -176,7 +200,7 @@ export class Games {
         game.winner = winner;
         const activeNonCivilians = game.players
             .filter(p => p.role !== ROLES.CIVILIAN)
-            .map(p => `${p.name}: ${p.role}`)
+            .map(p => `${playerLabel(p)}: ${p.role}`)
             .join('\n');
         const message = `🏆 ${winner} win!\n\n📜 Active Roles:\n${activeNonCivilians}`;
         await Promise.all([game.ownerId, ...game.players.map(p => p.id)].map(id => this.send(id, message)));
@@ -191,6 +215,11 @@ export class Games {
 
         // Only a private message proves the bot can DM this user.
         if (userId && msg.chat.type === 'private') this.users.add(userId);
+        // Keep the stored name/username of the host and listed players fresh.
+        if (userId) {
+            const mine = this.games.get(this.userGames.get(userId) ?? '');
+            if (mine && refreshIdentity(mine, msg.from)) await this.refreshLobby(mine);
+        }
 
         if (/\/start$/.test(text)) {
             await this.send(chatId, START_HINT);
@@ -215,10 +244,39 @@ export class Games {
             if (game.status !== GAME_STATUS.WAITING) return this.send(chatId, '❌ Roles are already assigned.');
             const err = validateSetup(game.players.length, suggestMafia(game.players.length));
             if (err) return this.send(chatId, `❌ ${err}`);
-            const view = renderConfirm(game, suggestMafia(game.players.length));
-            await this.send(chatId, view.text, { reply_markup: { inline_keyboard: view.keyboard } });
+            await this.sendDashboard(game, chatId, suggestMafia(game.players.length));
         } else if (/\/dashboard$/.test(text)) {
             await this.dashboard(chatId, userId);
+        } else if ((match = /\/addtest(?:\s+(\S+))?$/.exec(text))) {
+            await this.testPlayers(msg, 'add', match[1]);
+        } else if (/\/cleartest$/.test(text)) {
+            await this.testPlayers(msg, 'clear');
+        }
+    }
+
+    // Admin-only: add or remove fake players in the host's waiting lobby.
+    private async testPlayers(msg: any, action: 'add' | 'clear', countText?: string) {
+        const userId: number | undefined = msg.from?.id;
+        const chatId: number = msg.chat.id;
+        if (!userId) return;
+        if (msg.chat.type !== 'private') return this.send(chatId, '❌ Use this command in a private chat with the bot.');
+        if (!parseAdminIds(this.env.ADMIN_IDS).has(userId)) {
+            return this.send(chatId, `❌ Test mode is for admins. Your Telegram id is ${userId} — add it to ADMIN_IDS to enable.`);
+        }
+        const game = this.games.get(this.userGames.get(userId) ?? '');
+        if (!game || game.ownerId !== userId || game.status === GAME_STATUS.ENDED) {
+            return this.send(chatId, '❌ Create a game first with /creategame.');
+        }
+        if (game.status !== GAME_STATUS.WAITING) return this.send(chatId, '❌ Test players can only be changed while the lobby is open.');
+        if (action === 'add') {
+            const n = clampTestCount(countText);
+            addTestPlayers(game, n, this.games.values());
+            await this.refreshLobby(game);
+            await this.send(chatId, `🤖 Added ${n} test players (${game.players.length} interested)`);
+        } else {
+            const removed = clearTestPlayers(game);
+            await this.refreshLobby(game);
+            await this.send(chatId, `🤖 Removed ${removed} test players (${game.players.length} interested)`);
         }
     }
 
@@ -253,7 +311,7 @@ export class Games {
             this.userGames.delete(userId);
         }
         // Old "[players] [mafia]" numbers just become part of the title.
-        const game = newLobbyGame(userId, msg.from?.first_name ?? 'admin', titleText);
+        const game = newLobbyGame(userId, msg.from ? fullName(msg.from, 'admin') : 'admin', titleText, msg.from?.username);
         this.games.set(game.id, game);
         this.userGames.set(userId, game.id);
         const sent = await this.send(chatId, renderLobby(game), {
@@ -269,7 +327,10 @@ export class Games {
         const id: number = from.id;
         if (game.status !== GAME_STATUS.WAITING) return { ok: false, text: 'This game is closed.' };
         if (game.ownerId === id) return { ok: false, text: 'You\'re the host 🙂' };
-        if (game.players.some(p => p.id === id)) return { ok: false, text: 'You\'re already in ✅' };
+        if (game.players.some(p => p.id === id)) {
+            if (refreshIdentity(game, from)) await this.refreshLobby(game);
+            return { ok: false, text: 'You\'re already in ✅' };
+        }
         // One waiting lobby at a time; a running game blocks joining another.
         const otherId = this.userGames.get(id);
         const other = otherId && otherId !== game.id ? this.games.get(otherId) : undefined;
@@ -279,18 +340,19 @@ export class Games {
             other.players = other.players.filter(p => p.id !== id);
             await this.refreshLobby(other);
         }
-        game.players.push({
+        const player = {
             id,
-            name: from.first_name || 'Player',
+            name: fullName(from),
             username: from.username,
             role: null,
             isAlive: true,
             order: game.players.length,
             revealed: false,
-        });
+        };
+        game.players.push(player);
         this.userGames.set(id, game.id);
         await this.refreshLobby(game);
-        await this.send(game.ownerId, `🙋 ${from.first_name || 'Player'} is in (${game.players.length} interested)`);
+        await this.send(game.ownerId, `🙋 ${playerLabel(player)} is in (${game.players.length} interested)`);
         return { ok: true, text: 'You\'re in! ✅' };
     }
 
@@ -303,10 +365,11 @@ export class Games {
                 : 'This game is closed.';
         }
         if (!inList) return 'You weren\'t on the list.';
+        const leaver = playerLabel({ name: fullName(from), username: from.username });
         game.players = game.players.filter(p => p.id !== from.id);
         if (this.userGames.get(from.id) === game.id) this.userGames.delete(from.id);
         await this.refreshLobby(game);
-        await this.send(game.ownerId, `🙅 ${from.first_name || 'Player'} dropped out (${game.players.length} interested)`);
+        await this.send(game.ownerId, `🙅 ${leaver} dropped out (${game.players.length} interested)`);
         return 'Got it, you\'re out.';
     }
 
@@ -338,33 +401,20 @@ export class Games {
         const game = this.games.get(gameId)!;
         if (game.ownerId !== userId) return this.send(chatId, MESSAGES.NOT_AUTHORIZED_CHAT);
         if (game.status === GAME_STATUS.ENDED) return this.send(chatId, '⚠️ Game has ended.');
-        if (game.status === GAME_STATUS.WAITING) {
-            const view = renderPanel(game);
-            return this.send(chatId, view.text, { reply_markup: { inline_keyboard: view.keyboard } });
-        }
-        const anyUnrevealed = game.players.some(p => !p.revealed);
-        const keyboard: Keyboard = [];
-        if (anyUnrevealed) {
-            keyboard.push([{ text: '🔓 Reveal All', callback_data: `revealall_${gameId}` }]);
-            game.players.forEach(p => {
-                keyboard.push([{ text: `🎭 Reveal ${p.order}. ${p.name}`, callback_data: `reveal_${gameId}_${p.id}` }]);
-            });
-        } else {
-            game.players.forEach(p => {
-                if (p.isAlive) {
-                    keyboard.push([{ text: `❌ Eliminate ${p.order}. ${p.name}`, callback_data: `eliminateconfirm_${gameId}_${p.id}` }]);
-                }
-            });
-        }
-        let dashboardText = `📋 Game Dashboard (Status: ${game.status})`;
-        await this.deleteLastReveal(game);
-        if (!anyUnrevealed && game.status === GAME_STATUS.ACTIVE) {
-            dashboardText += '\n\n<b>Players with Roles:</b>';
-            game.players.forEach(p => {
-                dashboardText += `\n${p.order}. ${p.name} - ${p.role} ${p.isAlive ? '💚' : '💀'}`;
-            });
-        }
-        await this.send(chatId, dashboardText, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
+        if (game.status === GAME_STATUS.ACTIVE) await this.deleteLastReveal(game);
+        await this.sendDashboard(game, chatId);
+    }
+
+    // Sends a fresh live dashboard (deleting the previous one) and remembers its message ids.
+    // mafia: open the lock/setup confirmation instead of the panel.
+    private async sendDashboard(game: Game, chatId: number, mafia?: number) {
+        const old = game.dashboard;
+        if (old?.messageId) await this.tg('deleteMessage', { chat_id: old.chatId, message_id: old.messageId });
+        game.dashboard = { chatId, messageId: 0, mafia };
+        const view = renderDashboard(game);
+        const sent = await this.send(chatId, view.text, { parse_mode: 'HTML', reply_markup: { inline_keyboard: view.keyboard } });
+        if (sent) game.dashboard.messageId = sent.message_id;
+        else delete game.dashboard;
     }
 
     private async deleteLastReveal(game: Game) {
@@ -384,7 +434,7 @@ export class Games {
         } else if (!game) {
             const existing = this.games.get(this.userGames.get(from.id) ?? '');
             if (!existing || existing.status === GAME_STATUS.ENDED) {
-                game = newLobbyGame(from.id, from.first_name ?? 'admin', text);
+                game = newLobbyGame(from.id, fullName(from, 'admin'), text, from.username);
                 this.games.set(game.id, game);
                 this.userGames.set(from.id, game.id);
             }
@@ -415,27 +465,59 @@ export class Games {
         if (game) this.addInlineId(game, r.inline_message_id);
     }
 
-    private async lockAndDeal(game: Game, mafia: number, cb: any) {
+    private async lockAndDeal(game: Game, mafia: number) {
         game.maxPlayers = game.players.length;
         game.maxMafia = mafia;
         this.randomizeGame(game);
         game.status = GAME_STATUS.ACTIVE;
+        if (game.dashboard) delete game.dashboard.mafia;
+        // Also turns the dashboard message into the active dashboard.
         await this.refreshLobby(game);
-        await this.editPanel(cb, { text: '🔒 Roster locked.', keyboard: [] });
         await Promise.all(game.players.map(p => this.send(p.id,
             `🔒 Roster locked — you're playing in ${gameTitle(game)}! Your role is coming soon.`)));
-        await this.send(game.ownerId, '🎲 Roles assigned. Use /dashboard to reveal roles and manage the game.');
     }
+
+    // Callbacks that drive the owner dashboard (all owner-only).
+    private static readonly DASHBOARD_ACTIONS = new Set([
+        'lkick', 'llock', 'lmafia', 'lback', 'ldeal',
+        'reveal', 'revealall', 'eliminateconfirm', 'eliminate', 'elimno', 'cancel',
+    ]);
 
     private async onCallback(cb: any) {
         const [action, gameId, userIdStr] = (cb.data || '').split('_');
         const game = this.games.get(gameId);
-        if (!game) return this.answer(cb.id, action.startsWith('l') ? 'This game is closed.' : undefined);
+        if (!game) {
+            // Old clutter (e.g. a stale confirm message of a finished game): answer and tidy up.
+            if (action === 'cancel' || action === 'elimno') await this.deleteTapped(cb);
+            return this.answer(cb.id, action.startsWith('l') ? 'This game is closed.' : undefined);
+        }
         // Fallback capture of an inline-posted lobby in case chosen_inline_result is not enabled.
         if (cb.inline_message_id) this.addInlineId(game, cb.inline_message_id);
         const chatId: number | undefined = cb.message?.chat.id;
+        if (refreshIdentity(game, cb.from)) await this.refreshLobby(game);
         const isOwner = game.ownerId === cb.from.id;
         const waiting = game.status === GAME_STATUS.WAITING;
+        const active = game.status === GAME_STATUS.ACTIVE;
+        let toast: string | undefined;
+
+        if (Games.DASHBOARD_ACTIONS.has(action)) {
+            if (!isOwner) return this.answer(cb.id, MESSAGES.NOT_AUTHORIZED);
+            // Old two-message elimination flow: just tidy up, never act.
+            if (action === 'cancel') {
+                await this.deleteTapped(cb);
+                return this.answer(cb.id);
+            }
+            if (!chatId) return this.answer(cb.id);
+            const tappedId: number = cb.message.message_id;
+            if (!game.dashboard?.messageId) {
+                // No live dashboard yet (e.g. /startgame confirm or pre-upgrade message): adopt this one.
+                game.dashboard = { chatId, messageId: tappedId };
+            } else if (game.dashboard.chatId !== chatId || game.dashboard.messageId !== tappedId) {
+                // Button of an outdated dashboard: act on the game, show the result on the current one.
+                await this.deleteTapped(cb);
+            }
+        }
+
         switch (action) {
             case 'lin': {
                 if (!waiting) return this.answer(cb.id, 'This game is closed.');
@@ -450,7 +532,6 @@ export class Games {
             case 'lout':
                 return this.answer(cb.id, await this.removeInterested(game, cb.from));
             case 'lkick': {
-                if (!isOwner) return this.answer(cb.id, MESSAGES.NOT_AUTHORIZED);
                 if (!waiting) return this.answer(cb.id, 'This game is closed.');
                 const targetId = Number(userIdStr);
                 if (game.players.some(p => p.id === targetId)) {
@@ -458,93 +539,98 @@ export class Games {
                     if (this.userGames.get(targetId) === game.id) this.userGames.delete(targetId);
                     await this.refreshLobby(game);
                     await this.send(targetId, `ℹ️ The host removed you from ${gameTitle(game)}. Tap I'm in again if you can make it.`);
+                } else {
+                    await this.refreshDashboard(game);
                 }
-                await this.editPanel(cb, renderPanel(game));
                 break;
             }
             case 'llock':
             case 'lmafia':
             case 'lback':
             case 'ldeal': {
-                if (!isOwner) return this.answer(cb.id, MESSAGES.NOT_AUTHORIZED);
                 if (!waiting) return this.answer(cb.id, 'This game is closed.');
                 const n = game.players.length;
                 if (action === 'lback') {
-                    await this.editPanel(cb, renderPanel(game));
+                    delete game.dashboard!.mafia;
+                    await this.refreshDashboard(game);
                     break;
                 }
                 const mafia = action === 'llock' ? suggestMafia(n) : Number(userIdStr);
                 const err = validateSetup(n, mafia);
                 if (err) return this.answer(cb.id, err);
                 if (action === 'ldeal') {
-                    await this.lockAndDeal(game, mafia, cb);
+                    await this.lockAndDeal(game, mafia);
+                    toast = '🎲 Roles assigned — reveal them below.';
                 } else {
-                    await this.editPanel(cb, renderConfirm(game, mafia));
+                    game.dashboard!.mafia = mafia;
+                    await this.refreshDashboard(game);
                 }
                 break;
             }
             case 'reveal': {
-                if (!isOwner) return this.answer(cb.id, MESSAGES.NOT_AUTHORIZED);
                 const player = game.players.find(p => p.id === Number(userIdStr));
-                if (!player || !player.role) return;
+                if (!active || !player || !player.role) break;
                 player.revealed = true;
                 await this.deleteLastReveal(game);
-                const sentMsg = await this.sendPhoto(chatId!, ROLE_IMAGES[player.role], `🎭 ${player.name} is ${player.role}`);
+                const sentMsg = await this.sendPhoto(chatId!, ROLE_IMAGES[player.role], `🎭 ${playerLabel(player)} is ${player.role}`);
                 if (sentMsg) {
                     game.lastRevealChatId = sentMsg.chat.id;
                     game.lastRevealMessageId = sentMsg.message_id;
                 }
                 await this.sendPhoto(player.id, ROLE_IMAGES[player.role], `🎭 Your role is ${player.role}`);
+                const mates = teammatesText(game, player);
+                if (mates) await this.send(player.id, mates);
+                await this.refreshDashboard(game);
                 break;
             }
             case 'revealall': {
-                if (!isOwner) return this.answer(cb.id, MESSAGES.NOT_AUTHORIZED);
                 const unrevealed = game.players.filter(p => !p.revealed);
-                if (unrevealed.length === 0) break;
+                if (!active || unrevealed.length === 0) break;
                 await this.deleteLastReveal(game);
                 unrevealed.forEach(p => { p.revealed = true; });
                 await Promise.all(unrevealed.map(p =>
                     p.role ? this.sendPhoto(p.id, ROLE_IMAGES[p.role], `🎭 Your role is ${p.role}`) : null));
-                const mafiaPlayers = game.players.filter(p => p.role === ROLES.MAFIA || p.role === ROLES.DON);
-                await Promise.all(mafiaPlayers.map(player => {
-                    const teammates = mafiaPlayers
-                        .filter(p => p.id !== player.id)
-                        .map(p => `${p.name}${p.username ? ` (@${p.username})` : ''} - ${p.role}`)
-                        .join(', ');
-                    return this.send(player.id, `🤝 Mafia teammates: ${teammates}`);
+                await Promise.all(game.players.map(p => {
+                    const mates = teammatesText(game, p);
+                    return mates ? this.send(p.id, mates) : null;
                 }));
                 await this.send(chatId!, '🎭 All roles have been revealed.');
+                await this.refreshDashboard(game);
                 break;
             }
             case 'eliminateconfirm': {
-                if (!isOwner) return this.answer(cb.id, MESSAGES.NOT_AUTHORIZED);
-                const targetId = Number(userIdStr);
-                const playerName = game.players.find(p => p.id === targetId)?.name;
-                await this.send(chatId!, `⚠️ Confirm elimination of <b>${playerName}</b>?`, {
-                    parse_mode: 'HTML',
-                    reply_markup: { inline_keyboard: [[
-                        { text: '✅ Yes', callback_data: `eliminate_${gameId}_${targetId}` },
-                        { text: '❌ No', callback_data: `cancel_${gameId}` },
-                    ]] },
-                });
+                const target = game.players.find(p => p.id === Number(userIdStr));
+                if (active && target?.isAlive) game.dashboard!.eliminate = target.id;
+                await this.refreshDashboard(game);
+                break;
+            }
+            case 'elimno': {
+                delete game.dashboard!.eliminate;
+                await this.refreshDashboard(game);
+                toast = 'Cancelled';
                 break;
             }
             case 'eliminate': {
-                if (!isOwner) return this.answer(cb.id, MESSAGES.NOT_AUTHORIZED);
+                delete game.dashboard!.eliminate;
                 const player = game.players.find(p => p.id === Number(userIdStr));
-                if (!player || !player.isAlive) return;
+                if (!active || !player || !player.isAlive) {
+                    await this.refreshDashboard(game);
+                    break;
+                }
                 player.isAlive = false;
-                await this.send(chatId!, `☠️ ${player.name} has been eliminated.`);
-                await this.answer(cb.id);
+                await this.send(chatId!, `☠️ ${playerLabel(player)} has been eliminated.`);
                 const winner = checkWinCondition(game);
+                // endGame refreshes the dashboard into the final summary.
                 if (winner) await this.endGame(game, winner);
-                return;
-            }
-            case 'cancel': {
-                await this.send(chatId!, '❎ Elimination cancelled.');
+                else await this.refreshDashboard(game);
                 break;
             }
         }
-        await this.answer(cb.id);
+        await this.answer(cb.id, toast);
+    }
+
+    // Deletes the message a callback button was on (errors ignored).
+    private async deleteTapped(cb: any) {
+        if (cb.message) await this.tg('deleteMessage', { chat_id: cb.message.chat.id, message_id: cb.message.message_id });
     }
 }

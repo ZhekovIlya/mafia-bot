@@ -96,3 +96,26 @@ In @BotFather: `/setinline` (enable, placeholder e.g. `game title, e.g. Friday 2
 
 ## Out of scope
 Broadcast, night actions, undo elimination, teammate-message fix, anything else.
+
+## Addendum: names and test players
+
+### Names
+- Display name is `first_name` + ` last_name` (when present); `username` is stored separately. Every user-facing mention uses `playerLabel`: `Name (@username)`, or `Name` without a username (lobby list and host line, panel buttons, owner DMs, dashboard roster and buttons, reveal caption, elimination messages, end-game roles, mafia teammates).
+- `Game.ownerUsername` (optional) is set on create. Stored name/username of the host and listed players are refreshed from the latest `from` on any message or callback.
+- Inline button text is capped at ~40 chars: the name is truncated with `…`, the `(@username)` stays intact. HTML messages escape the label.
+
+### Test players (admin-only)
+- `ADMIN_IDS` env var (comma-separated Telegram ids; Worker secret, Node `.env`).
+- `/addtest [n]` (private chat, host of a `waiting` game, id in `ADMIN_IDS`; n defaults to 1, clamped 1..12) adds `🤖 Test N` players with unique negative ids and `isTest: true`. `/cleartest` removes them. Non-admins get `❌ Test mode is for admins. Your Telegram id is <id> — add it to ADMIN_IDS to enable.`; admins without a waiting game get `❌ Create a game first with /creategame.`
+- Test players are not in `userGames` or known users, otherwise behave like real players (lobby count, remove, deal, reveal, eliminate, win check, summaries). Nothing is ever sent to them (single guard in `send`/`sendPhoto`); the host still gets reveal captions.
+- `npm run simulate` (`scripts/simulate.ts`) drives the Durable Object end to end with a mocked Telegram API.
+
+## Addendum: live dashboard
+- One live owner message per game: `game.dashboard = { chatId, messageId, mafia?, eliminate? }` (optional, old state loads). `mafia` = the waiting panel shows the lock/setup confirmation with that count; `eliminate` = the active dashboard asks "Eliminate N. Name?" for that player.
+- Rendering is the pure `renderDashboard(game)` in `src/util.ts` (HTML): waiting panel, setup confirm, active-unrevealed, active-revealed (roster with roles and 💚/💀), ended (winner and full roster, no buttons), cancelled ("❌ Game cancelled.", no buttons).
+- `/dashboard` deletes the old dashboard message (errors ignored), sends a fresh one and stores its ids. `/startgame` does the same but opens the setup confirm. A callback with no stored dashboard adopts the tapped message.
+- `refreshDashboard(game)` edits the stored message (`editMessageText`, HTML, current keyboard); errors incl. "message is not modified" are logged and ignored. It runs after every state change: `refreshLobby` calls it (join, leave, kick, addtest, cleartest, name refresh, ldeal, game end, abort) and callbacks call it directly (setup steps, reveal, reveal all, eliminate confirm / yes / no).
+- `ldeal` turns the same message into the active dashboard; the host gets a toast ("Roles assigned") instead of a chat message. End of game edits it to the final summary; abort to "Game cancelled."; end-game DMs stay.
+- Elimination: `❌ Eliminate` edits the dashboard into `⚠️ Eliminate N. Name (@nick)?` with `eliminate_` (Yes) / `elimno_` (No). Yes sends "☠️ … has been eliminated." and refreshes; No toasts "Cancelled" and refreshes. No confirm/cancelled messages are sent. A stale `cancel_` button (old flow) only deletes its own message.
+- A button on a message that is not the current dashboard still acts on the game, the tapped message is deleted, and the current dashboard is refreshed.
+- Single 🎭 Reveal of a Mafia/Don also DMs their teammates list (same text as Reveal All; skipped when they have none).

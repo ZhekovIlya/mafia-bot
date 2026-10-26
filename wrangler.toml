@@ -1,4 +1,5 @@
 # Cloudflare Workers deployment (free plan). Secrets BOT_TOKEN, BOT_USERNAME and WEBHOOK_SECRET are set with `wrangler secret put`.
+# Optional secret ADMIN_IDS (comma-separated Telegram ids) enables /addtest and /cleartest: wrangler secret put ADMIN_IDS.
 name = "mafia-bot"
 main = "worker/index.ts"
 compatibility_date = "2025-09-01"

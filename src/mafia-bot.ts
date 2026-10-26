@@ -9,6 +9,7 @@ import {
     ROLES,
     Role,
     Game,
+    Player,
     Keyboard,
     shuffleArray,
     generateRoles,
@@ -19,10 +20,18 @@ import {
     hostedOpenGame,
     renderLobby,
     lobbyKeyboard,
-    renderPanel,
-    renderConfirm,
+    renderDashboard,
+    teammatesText,
     suggestMafia,
     validateSetup,
+    playerLabel,
+    fullName,
+    refreshIdentity,
+    parseAdminIds,
+    clampTestCount,
+    isTestId,
+    addTestPlayers,
+    clearTestPlayers,
 } from './util';
 import path from 'path';
 dotenv.config();
@@ -37,6 +46,8 @@ const ROLE_IMAGES: Record<Role, string> = {
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const BOT_USERNAME = process.env.BOT_USERNAME;
+// Comma-separated Telegram user ids allowed to use /addtest
+const ADMIN_IDS = parseAdminIds(process.env.ADMIN_IDS);
 
 if (!BOT_TOKEN) {
     throw new Error('BOT_TOKEN is required.');
@@ -61,12 +72,57 @@ const randomizeGame = (game: Game) => {
     }));
 };
 
+// Fake test players have no Telegram chat: never message them.
+const isTest = (id: number) => isTestId(games.values(), id);
+
 // DM that must never throw (e.g. the user blocked the bot).
 const dm = (chatId: number, text: string, options?: TelegramBot.SendMessageOptions) =>
-    bot.sendMessage(chatId, text, options).catch(err => console.error('sendMessage failed:', err?.message ?? err));
+    isTest(chatId)
+        ? Promise.resolve(null)
+        : bot.sendMessage(chatId, text, options).catch(err => console.error('sendMessage failed:', err?.message ?? err));
 
-// Re-renders every lobby message of a game; failed edits are logged and never break the flow.
+const dmPhoto = (chatId: number, photo: string, caption: string) =>
+    isTest(chatId)
+        ? Promise.resolve(null)
+        : bot.sendPhoto(chatId, photo, { caption }).catch(err => console.error('sendPhoto failed:', err?.message ?? err));
+
+// Edits the one live dashboard message to the current state. No dashboard stored: nothing to do.
+// Failed edits (including "message is not modified") are logged and never break the flow.
+const refreshDashboard = async (game: Game) => {
+    const d = game.dashboard;
+    if (!d?.messageId) return;
+    const view = renderDashboard(game);
+    await bot.editMessageText(view.text, {
+        chat_id: d.chatId,
+        message_id: d.messageId,
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: view.keyboard } as TelegramBot.InlineKeyboardMarkup,
+    }).catch(err => console.error('editMessageText (dashboard) failed:', err?.message ?? err));
+};
+
+// Sends a fresh live dashboard (deleting the previous one) and remembers its message ids.
+// mafia: open the lock/setup confirmation instead of the panel.
+const sendDashboard = async (game: Game, chatId: number, mafia?: number) => {
+    const old = game.dashboard;
+    if (old?.messageId) await bot.deleteMessage(old.chatId, old.messageId).catch(err => console.error('deleteMessage failed:', err?.message ?? err));
+    game.dashboard = { chatId, messageId: 0, mafia };
+    const view = renderDashboard(game);
+    try {
+        const sent = await bot.sendMessage(chatId, view.text, {
+            parse_mode: 'HTML',
+            reply_markup: { inline_keyboard: view.keyboard } as TelegramBot.InlineKeyboardMarkup,
+        });
+        game.dashboard.messageId = sent.message_id;
+    } catch (err: any) {
+        console.error('sendMessage failed:', err?.message ?? err);
+        delete game.dashboard;
+    }
+};
+
+// Re-renders every lobby message of a game (and the live dashboard, whose waiting-phase panel
+// lists the same players); failed edits are logged and never break the flow.
 const refreshLobby = async (game: Game) => {
+    await refreshDashboard(game);
     const base = { parse_mode: 'HTML' as const };
     const text = renderLobby(game);
     const edits: Promise<unknown>[] = [
@@ -91,27 +147,20 @@ const addInlineId = (game: Game, inlineId: string | undefined) => {
     if (!game.lobbyInlineIds.includes(inlineId)) game.lobbyInlineIds.push(inlineId);
 };
 
-// Edits a plain-text owner panel message in place.
-const editPanel = (cb: TelegramBot.CallbackQuery, view: { text: string; keyboard: Keyboard }) =>
-    bot.editMessageText(view.text, {
-        chat_id: cb.message!.chat.id,
-        message_id: cb.message!.message_id,
-        reply_markup: { inline_keyboard: view.keyboard } as TelegramBot.InlineKeyboardMarkup,
-    }).catch(err => console.error('editMessageText failed:', err?.message ?? err));
-
-const endGame = (game: Game, winner: string) => {
+const endGame = async (game: Game, winner: string) => {
     game.status = GAME_STATUS.ENDED;
     game.winner = winner;
     const activeNonCivilians = game.players
         .filter(p => p.role !== ROLES.CIVILIAN)
-        .map(p => `${p.name}: ${p.role}`)
+        .map(p => `${playerLabel(p)}: ${p.role}`)
         .join('\n');
     const message = `🏆 ${winner} win!\n\n📜 Active Roles:\n${activeNonCivilians}`;
-    bot.sendMessage(game.ownerId, message);
+    dm(game.ownerId, message);
     game.players.forEach(p => {
-        bot.sendMessage(p.id, message);
+        dm(p.id, message);
     });
-    refreshLobby(game);
+    // Also turns the dashboard into the final summary.
+    await refreshLobby(game);
 };
 
 // Adds a user to a waiting lobby. ok=false carries the reason to show the user.
@@ -119,7 +168,10 @@ const addInterested = async (game: Game, from: TelegramBot.User): Promise<{ ok: 
     const id = from.id;
     if (game.status !== GAME_STATUS.WAITING) return { ok: false, text: 'This game is closed.' };
     if (game.ownerId === id) return { ok: false, text: 'You\'re the host 🙂' };
-    if (game.players.some(p => p.id === id)) return { ok: false, text: 'You\'re already in ✅' };
+    if (game.players.some(p => p.id === id)) {
+        if (refreshIdentity(game, from)) await refreshLobby(game);
+        return { ok: false, text: 'You\'re already in ✅' };
+    }
     // One waiting lobby at a time; a running game blocks joining another.
     const otherId = userGames.get(id);
     const other = otherId && otherId !== game.id ? games.get(otherId) : undefined;
@@ -129,11 +181,11 @@ const addInterested = async (game: Game, from: TelegramBot.User): Promise<{ ok: 
         other.players = other.players.filter(p => p.id !== id);
         await refreshLobby(other);
     }
-    const name = from.first_name || 'Player';
-    game.players.push({ id, name, username: from.username, role: null, isAlive: true, order: game.players.length, revealed: false });
+    const player: Player = { id, name: fullName(from), username: from.username, role: null, isAlive: true, order: game.players.length, revealed: false };
+    game.players.push(player);
     userGames.set(id, game.id);
     await refreshLobby(game);
-    dm(game.ownerId, `🙋 ${name} is in (${game.players.length} interested)`);
+    dm(game.ownerId, `🙋 ${playerLabel(player)} is in (${game.players.length} interested)`);
     return { ok: true, text: 'You\'re in! ✅' };
 };
 
@@ -144,16 +196,22 @@ const removeInterested = async (game: Game, from: TelegramBot.User): Promise<str
         return inList && game.status === GAME_STATUS.ACTIVE ? 'Roster is locked — ask the host.' : 'This game is closed.';
     }
     if (!inList) return 'You weren\'t on the list.';
+    const leaver = playerLabel({ name: fullName(from), username: from.username });
     game.players = game.players.filter(p => p.id !== from.id);
     if (userGames.get(from.id) === game.id) userGames.delete(from.id);
     await refreshLobby(game);
-    dm(game.ownerId, `🙅 ${from.first_name || 'Player'} dropped out (${game.players.length} interested)`);
+    dm(game.ownerId, `🙅 ${leaver} dropped out (${game.players.length} interested)`);
     return 'Got it, you\'re out.';
 };
 
-bot.on('message', msg => {
+bot.on('message', async msg => {
     // Only a private message proves the bot can DM this user.
     if (msg.from && msg.chat.type === 'private') knownUsers.add(msg.from.id);
+    // Keep the stored name/username of the host and listed players fresh.
+    if (msg.from) {
+        const mine = games.get(userGames.get(msg.from.id) ?? '');
+        if (mine && refreshIdentity(mine, msg.from)) await refreshLobby(mine);
+    }
 });
 
 bot.onText(/\/start$/, msg => {
@@ -205,9 +263,9 @@ bot.onText(/\/creategame(?:\s+([\s\S]+))?$/, async (msg, match) => {
         }
         userGames.delete(userId);
     }
-    const name = msg.from?.first_name ?? 'admin';
+    const name = msg.from ? fullName(msg.from, 'admin') : 'admin';
     // Old "[players] [mafia]" numbers just become part of the title.
-    const game = newLobbyGame(userId, name, match?.[1]);
+    const game = newLobbyGame(userId, name, match?.[1], msg.from?.username);
     games.set(game.id, game);
     userGames.set(userId, game.id);
     const sent = await bot.sendMessage(msg.chat.id, renderLobby(game), {
@@ -260,48 +318,54 @@ bot.onText(/\/startgame$/, msg => {
     if (game.status !== GAME_STATUS.WAITING) return bot.sendMessage(msg.chat.id, '❌ Roles are already assigned.');
     const err = validateSetup(game.players.length, suggestMafia(game.players.length));
     if (err) return bot.sendMessage(msg.chat.id, `❌ ${err}`);
-    const view = renderConfirm(game, suggestMafia(game.players.length));
-    bot.sendMessage(msg.chat.id, view.text, { reply_markup: { inline_keyboard: view.keyboard } as TelegramBot.InlineKeyboardMarkup });
+    sendDashboard(game, msg.chat.id, suggestMafia(game.players.length));
 });
 
-bot.onText(/\/dashboard$/, msg => {
+bot.onText(/\/dashboard$/, async msg => {
     const userId = msg.from?.id;
     const gameId = userGames.get(userId!);
     if (!gameId) return bot.sendMessage(msg.chat.id, '❌ No game found!');
     const game = games.get(gameId)!;
     if (game.ownerId !== userId) return bot.sendMessage(msg.chat.id, `${MESSAGES.NOT_AUTHORIZED_CHAT}`);
     if (game.status === GAME_STATUS.ENDED) return bot.sendMessage(msg.chat.id, '⚠️ Game has ended.');
-    if (game.status === GAME_STATUS.WAITING) {
-        const view = renderPanel(game);
-        return bot.sendMessage(msg.chat.id, view.text, { reply_markup: { inline_keyboard: view.keyboard } as TelegramBot.InlineKeyboardMarkup });
+    if (game.status === GAME_STATUS.ACTIVE && game.lastRevealChatId && game.lastRevealMessageId) {
+        await bot.deleteMessage(game.lastRevealChatId, game.lastRevealMessageId).catch(() => undefined);
     }
-    const anyUnrevealed = game.players.some(p => !p.revealed);
-    const keyboard: Array<Array<{ text: string; callback_data: string }>> = [];
-    if (anyUnrevealed) {
-        keyboard.push([{ text: '🔓 Reveal All', callback_data: `revealall_${gameId}` }]);
-        game.players.forEach(p => {
-            const revealData = `reveal_${gameId}_${p.id}`;
-            keyboard.push([{ text: `🎭 Reveal ${p.order}. ${p.name}`, callback_data: revealData }]);
-        });
+    await sendDashboard(game, msg.chat.id);
+});
+
+// Admin-only: add or remove fake players in the host's waiting lobby.
+const testPlayers = async (msg: TelegramBot.Message, action: 'add' | 'clear', countText?: string) => {
+    const userId = msg.from?.id;
+    const chatId = msg.chat.id;
+    if (!userId) return;
+    if (msg.chat.type !== 'private') return bot.sendMessage(chatId, '❌ Use this command in a private chat with the bot.');
+    if (!ADMIN_IDS.has(userId)) {
+        return bot.sendMessage(chatId, `❌ Test mode is for admins. Your Telegram id is ${userId} — add it to ADMIN_IDS to enable.`);
+    }
+    const game = games.get(userGames.get(userId) ?? '');
+    if (!game || game.ownerId !== userId || game.status === GAME_STATUS.ENDED) {
+        return bot.sendMessage(chatId, '❌ Create a game first with /creategame.');
+    }
+    if (game.status !== GAME_STATUS.WAITING) return bot.sendMessage(chatId, '❌ Test players can only be changed while the lobby is open.');
+    if (action === 'add') {
+        const n = clampTestCount(countText);
+        addTestPlayers(game, n, games.values());
+        await refreshLobby(game);
+        bot.sendMessage(chatId, `🤖 Added ${n} test players (${game.players.length} interested)`);
     } else {
-        game.players.forEach(p => {
-            if (p.isAlive) {
-                const eliminateConfirmData = `eliminateconfirm_${gameId}_${p.id}`;
-                keyboard.push([{ text: `❌ Eliminate ${p.order}. ${p.name}`, callback_data: eliminateConfirmData }]);
-            }
-        });
+        const removed = clearTestPlayers(game);
+        await refreshLobby(game);
+        bot.sendMessage(chatId, `🤖 Removed ${removed} test players (${game.players.length} interested)`);
     }
-    let dashboardText = `📋 Game Dashboard (Status: ${game.status})`;
-    if (game.lastRevealChatId && game.lastRevealMessageId) {
-        bot.deleteMessage(game.lastRevealChatId, game.lastRevealMessageId);
-    }
-    if (!anyUnrevealed && game.status === GAME_STATUS.ACTIVE) {
-        dashboardText += '\n\n<b>Players with Roles:</b>';
-        game.players.forEach(p => {
-            dashboardText += `\n${p.order}. ${p.name} - ${p.role} ${p.isAlive ? '💚' : '💀'}`;
-        });
-    }
-    bot.sendMessage(msg.chat.id, dashboardText, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
+};
+
+bot.onText(/\/addtest(?:\s+(\S+))?$/, (msg, match) => {
+    testPlayers(msg, 'add', match?.[1]);
+});
+
+bot.onText(/\/cleartest$/, msg => {
+    testPlayers(msg, 'clear');
 });
 
 // Inline mode: `@bot <title or gameId>` offers the host's lobby to post anywhere.
@@ -314,7 +378,7 @@ bot.on('inline_query', async q => {
     } else if (!game) {
         const existing = games.get(userGames.get(from.id) ?? '');
         if (!existing || existing.status === GAME_STATUS.ENDED) {
-            game = newLobbyGame(from.id, from.first_name ?? 'admin', text);
+            game = newLobbyGame(from.id, fullName(from, 'admin'), text, from.username);
             games.set(game.id, game);
             userGames.set(from.id, game.id);
         }
@@ -342,18 +406,30 @@ bot.on('chosen_inline_result', r => {
     if (game) addInlineId(game, r.inline_message_id);
 });
 
-const lockAndDeal = async (game: Game, mafia: number, cb: TelegramBot.CallbackQuery) => {
+const lockAndDeal = async (game: Game, mafia: number) => {
     game.maxPlayers = game.players.length;
     game.maxMafia = mafia;
     randomizeGame(game);
     game.status = GAME_STATUS.ACTIVE;
+    if (game.dashboard) delete game.dashboard.mafia;
+    // Also turns the dashboard message into the active dashboard.
     await refreshLobby(game);
-    await editPanel(cb, { text: '🔒 Roster locked.', keyboard: [] });
     game.players.forEach(p => {
         dm(p.id, `🔒 Roster locked — you're playing in ${gameTitle(game)}! Your role is coming soon.`);
     });
-    dm(game.ownerId, '🎲 Roles assigned. Use /dashboard to reveal roles and manage the game.');
 };
+
+// Callbacks that drive the owner dashboard (all owner-only).
+const DASHBOARD_ACTIONS = new Set([
+    'lkick', 'llock', 'lmafia', 'lback', 'ldeal',
+    'reveal', 'revealall', 'eliminateconfirm', 'eliminate', 'elimno', 'cancel',
+]);
+
+// Deletes the message a callback button was on (errors ignored).
+const deleteTapped = (cb: TelegramBot.CallbackQuery) =>
+    cb.message
+        ? bot.deleteMessage(cb.message.chat.id, cb.message.message_id).catch(err => console.error('deleteMessage failed:', err?.message ?? err))
+        : Promise.resolve();
 
 bot.on('callback_query', async cb => {
     const data = cb.data || '';
@@ -362,11 +438,37 @@ bot.on('callback_query', async cb => {
     const gameId = parts[1];
     const userIdStr = parts[2];
     const game = games.get(gameId);
-    if (!game) return bot.answerCallbackQuery(cb.id, action.startsWith('l') ? { text: 'This game is closed.' } : undefined);
+    if (game && refreshIdentity(game, cb.from)) await refreshLobby(game);
+    if (!game) {
+        // Old clutter (e.g. a stale confirm message of a finished game): answer and tidy up.
+        if (action === 'cancel' || action === 'elimno') await deleteTapped(cb);
+        return bot.answerCallbackQuery(cb.id, action.startsWith('l') ? { text: 'This game is closed.' } : undefined);
+    }
     // Fallback capture of an inline-posted lobby in case chosen_inline_result is not enabled.
     addInlineId(game, cb.inline_message_id);
     const isOwner = game.ownerId === cb.from.id;
     const waiting = game.status === GAME_STATUS.WAITING;
+    const active = game.status === GAME_STATUS.ACTIVE;
+    const chatId = cb.message?.chat.id;
+    let toast: string | undefined;
+
+    if (DASHBOARD_ACTIONS.has(action)) {
+        if (!isOwner) return bot.answerCallbackQuery(cb.id, { text: MESSAGES.NOT_AUTHORIZED });
+        // Old two-message elimination flow: just tidy up, never act.
+        if (action === 'cancel') {
+            await deleteTapped(cb);
+            return bot.answerCallbackQuery(cb.id);
+        }
+        if (!cb.message || chatId === undefined) return bot.answerCallbackQuery(cb.id);
+        if (!game.dashboard?.messageId) {
+            // No live dashboard yet (e.g. /startgame confirm or pre-upgrade message): adopt this one.
+            game.dashboard = { chatId, messageId: cb.message.message_id };
+        } else if (game.dashboard.chatId !== chatId || game.dashboard.messageId !== cb.message.message_id) {
+            // Button of an outdated dashboard: act on the game, show the result on the current one.
+            await deleteTapped(cb);
+        }
+    }
+
     switch (action) {
         case 'lin': {
             if (!waiting) return bot.answerCallbackQuery(cb.id, { text: 'This game is closed.' });
@@ -382,7 +484,6 @@ bot.on('callback_query', async cb => {
             return bot.answerCallbackQuery(cb.id, { text: await removeInterested(game, cb.from) });
         }
         case 'lkick': {
-            if (!isOwner) return bot.answerCallbackQuery(cb.id, { text: MESSAGES.NOT_AUTHORIZED });
             if (!waiting) return bot.answerCallbackQuery(cb.id, { text: 'This game is closed.' });
             const targetId = Number(userIdStr);
             if (game.players.some(p => p.id === targetId)) {
@@ -390,39 +491,37 @@ bot.on('callback_query', async cb => {
                 if (userGames.get(targetId) === game.id) userGames.delete(targetId);
                 await refreshLobby(game);
                 dm(targetId, `ℹ️ The host removed you from ${gameTitle(game)}. Tap I'm in again if you can make it.`);
+            } else {
+                await refreshDashboard(game);
             }
-            await editPanel(cb, renderPanel(game));
-            bot.answerCallbackQuery(cb.id);
             break;
         }
         case 'llock':
         case 'lmafia':
         case 'lback':
         case 'ldeal': {
-            if (!isOwner) return bot.answerCallbackQuery(cb.id, { text: MESSAGES.NOT_AUTHORIZED });
             if (!waiting) return bot.answerCallbackQuery(cb.id, { text: 'This game is closed.' });
             const n = game.players.length;
             if (action === 'lback') {
-                await editPanel(cb, renderPanel(game));
-                bot.answerCallbackQuery(cb.id);
+                delete game.dashboard!.mafia;
+                await refreshDashboard(game);
                 break;
             }
             const mafia = action === 'llock' ? suggestMafia(n) : Number(userIdStr);
             const err = validateSetup(n, mafia);
             if (err) return bot.answerCallbackQuery(cb.id, { text: err });
             if (action === 'ldeal') {
-                await lockAndDeal(game, mafia, cb);
+                await lockAndDeal(game, mafia);
+                toast = '🎲 Roles assigned — reveal them below.';
             } else {
-                await editPanel(cb, renderConfirm(game, mafia));
+                game.dashboard!.mafia = mafia;
+                await refreshDashboard(game);
             }
-            bot.answerCallbackQuery(cb.id);
             break;
         }
         case 'reveal': {
-            const targetId = Number(userIdStr);
-            if (game.ownerId !== cb.from.id) return bot.answerCallbackQuery(cb.id, { text: MESSAGES.NOT_AUTHORIZED });
-            const player = game.players.find(p => p.id === targetId);
-            if (!player || !player.role) return;
+            const player = game.players.find(p => p.id === Number(userIdStr));
+            if (!active || !player || !player.role) break;
             player.revealed = true;
             const roleImage = ROLE_IMAGES[player.role];
             if (game.lastRevealChatId && game.lastRevealMessageId) {
@@ -431,20 +530,18 @@ bot.on('callback_query', async cb => {
                 } catch {
                 }
             }
-            const sentMsg = await bot.sendPhoto(cb.message!.chat.id, roleImage, { caption: `🎭 ${player.name} is ${player.role}` });
+            const sentMsg = await bot.sendPhoto(chatId!, roleImage, { caption: `🎭 ${playerLabel(player)} is ${player.role}` });
             game.lastRevealChatId = sentMsg.chat.id;
             game.lastRevealMessageId = sentMsg.message_id;
-            await bot.sendPhoto(player.id, roleImage, { caption: `🎭 Your role is ${player.role}` });
-            bot.answerCallbackQuery(cb.id);
+            await dmPhoto(player.id, roleImage, `🎭 Your role is ${player.role}`);
+            const mates = teammatesText(game, player);
+            if (mates) await dm(player.id, mates);
+            await refreshDashboard(game);
             break;
         }
         case 'revealall': {
-            if (game.ownerId !== cb.from.id) return bot.answerCallbackQuery(cb.id, { text: MESSAGES.NOT_AUTHORIZED });
             const unrevealed = game.players.filter(p => !p.revealed);
-            if (unrevealed.length === 0) {
-                bot.answerCallbackQuery(cb.id);
-                break;
-            }
+            if (!active || unrevealed.length === 0) break;
             if (game.lastRevealChatId && game.lastRevealMessageId) {
                 try {
                     await bot.deleteMessage(game.lastRevealChatId, game.lastRevealMessageId);
@@ -457,67 +554,48 @@ bot.on('callback_query', async cb => {
             await Promise.all(
                 unrevealed.map(p => {
                     if (!p.role) return Promise.resolve();
-                    return bot.sendPhoto(p.id, ROLE_IMAGES[p.role], { caption: `🎭 Your role is ${p.role}` });
+                    return dmPhoto(p.id, ROLE_IMAGES[p.role], `🎭 Your role is ${p.role}`);
                 })
             );
-
-            const mafiaPlayers = game.players.filter(
-                p => p.role === ROLES.MAFIA || p.role === ROLES.DON,
-            );
             await Promise.all(
-                mafiaPlayers.map(player => {
-                    const teammates = mafiaPlayers
-                        .filter(p => p.id !== player.id)
-                        .map(
-                            p =>
-                                `${p.name}${p.username ? ` (@${p.username})` : ''} - ${p.role}`,
-                        )
-                        .join(', ');
-                    return bot.sendMessage(
-                        player.id,
-                        `🤝 Mafia teammates: ${teammates}`,
-                    );
+                game.players.map(p => {
+                    const mates = teammatesText(game, p);
+                    return mates ? dm(p.id, mates) : null;
                 }),
             );
-
-            await bot.sendMessage(cb.message!.chat.id, '🎭 All roles have been revealed.');
-            bot.answerCallbackQuery(cb.id);
+            await bot.sendMessage(chatId!, '🎭 All roles have been revealed.');
+            await refreshDashboard(game);
             break;
         }
         case 'eliminateconfirm': {
-            const targetId = Number(userIdStr);
-            if (game.ownerId !== cb.from.id) return bot.answerCallbackQuery(cb.id, { text: MESSAGES.NOT_AUTHORIZED });
-            const confirmKeyboard = {
-                inline_keyboard: [[
-                    { text: '✅ Yes', callback_data: `eliminate_${gameId}_${targetId}` },
-                    { text: '❌ No', callback_data: `cancel_${gameId}` }
-                ]]
-            };
-            const playerName = game.players.find(p => p.id === targetId)?.name;
-            bot.sendMessage(cb.message!.chat.id, `⚠️ Confirm elimination of <b>${playerName}</b>?`, { parse_mode: 'HTML', reply_markup: confirmKeyboard });
-            bot.answerCallbackQuery(cb.id);
+            const target = game.players.find(p => p.id === Number(userIdStr));
+            if (active && target?.isAlive) game.dashboard!.eliminate = target.id;
+            await refreshDashboard(game);
+            break;
+        }
+        case 'elimno': {
+            delete game.dashboard!.eliminate;
+            await refreshDashboard(game);
+            toast = 'Cancelled';
             break;
         }
         case 'eliminate': {
-            const targetId = Number(userIdStr);
-            if (game.ownerId !== cb.from.id) return bot.answerCallbackQuery(cb.id, { text: MESSAGES.NOT_AUTHORIZED });
-            const player = game.players.find(p => p.id === targetId);
-            if (!player || !player.isAlive) return;
+            delete game.dashboard!.eliminate;
+            const player = game.players.find(p => p.id === Number(userIdStr));
+            if (!active || !player || !player.isAlive) {
+                await refreshDashboard(game);
+                break;
+            }
             player.isAlive = false;
-            bot.sendMessage(cb.message!.chat.id, `☠️ ${player.name} has been eliminated.`);
-            bot.answerCallbackQuery(cb.id);
+            await bot.sendMessage(chatId!, `☠️ ${playerLabel(player)} has been eliminated.`);
             const winner = checkWinCondition(game);
-            if (winner) endGame(game, winner);
+            // endGame refreshes the dashboard into the final summary.
+            if (winner) await endGame(game, winner);
+            else await refreshDashboard(game);
             break;
         }
-        case 'cancel': {
-            bot.sendMessage(cb.message!.chat.id, '❎ Elimination cancelled.');
-            bot.answerCallbackQuery(cb.id);
-            break;
-        }
-        default:
-            bot.answerCallbackQuery(cb.id);
     }
+    bot.answerCallbackQuery(cb.id, toast ? { text: toast } : undefined);
 });
 
 bot.on('polling_error', console.error);
