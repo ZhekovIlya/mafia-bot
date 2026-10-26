@@ -3,7 +3,7 @@
 // Run with: npm run simulate
 import { Games } from '../worker/index';
 
-type Call = { method: string; body: any };
+type Call = { method: string; body: any; messageId?: number };
 const calls: Call[] = [];
 let messageSeq = 1000;
 
@@ -11,9 +11,11 @@ let messageSeq = 1000;
 (globalThis as any).fetch = async (url: string, init: { body: string }) => {
     const method = String(url).split('/').pop() as string;
     const body = JSON.parse(init.body);
-    calls.push({ method, body });
+    const call: Call = { method, body };
+    calls.push(call);
     const hasMessage = ['sendMessage', 'sendPhoto'].includes(method);
-    const result = hasMessage ? { message_id: ++messageSeq, chat: { id: body.chat_id } } : true;
+    if (hasMessage) call.messageId = ++messageSeq;
+    const result = hasMessage ? { message_id: call.messageId, chat: { id: body.chat_id } } : true;
     return new Response(JSON.stringify({ ok: true, result }));
 };
 
@@ -39,7 +41,7 @@ const last = (pred: (c: Call) => boolean, from = 0) => [...calls.slice(from)].re
 type User = { id: number; first_name: string; last_name?: string; username?: string };
 let updateSeq = 0;
 
-const scenario = async (title: string, opts: { extraTest: number; winner: 'Civilians' | 'Mafia'; staleName?: boolean }) => {
+const scenario = async (title: string, opts: { extraTest: number; winner: 'Civilians' | 'Mafia'; staleName?: boolean; redash?: boolean }) => {
     console.log(`\n=== ${title} ===`);
     const store = new Map<string, unknown>();
     const state = {
@@ -97,47 +99,113 @@ const scenario = async (title: string, opts: { extraTest: number; winner: 'Civil
     const lobbyEdit = last(c => c.method === 'editMessageText' && textOf(c).includes('Interested'), afterJoin)!;
     check('lobby lists test players', textOf(lobbyEdit).includes('🤖 Test 1') && textOf(lobbyEdit).includes(`Test ${opts.extraTest}`), textOf(lobbyEdit));
 
-    // Panel -> lock & deal.
+    // The host sends /dashboard once; from then on everything happens on that one message.
+    let dashCommands = 1;
+    const afterAdd = calls.length;
     await say(host, '/dashboard');
-    const panel = last(c => c.method === 'sendMessage' && textOf(c).startsWith('📋 Lobby'), start)!;
+    const panel = last(c => c.method === 'sendMessage' && textOf(c).startsWith('📋 Lobby'), afterAdd)!;
+    let dashId = panel.messageId!;
+    const editsOf = (id: number, from: number) =>
+        calls.slice(from).filter(c => c.method === 'editMessageText' && c.body.chat_id === 1001 && c.body.message_id === id);
+    const latestDash = (id: number, from: number) => editsOf(id, from).pop();
     const removeBtn = buttons(panel).find(b => b.callback_data?.startsWith('lkick_') && b.text.includes('Bea'));
     check('panel remove button shows Name (@username)', !!removeBtn && removeBtn.text.includes('(@girl)'), removeBtn?.text);
     const lockBtn = buttons(panel).find(b => b.callback_data?.startsWith('llock_'))!;
-    await tap(host, lockBtn.callback_data!, 5);
-    const confirm = last(c => c.method === 'editMessageText' && textOf(c).startsWith('🔒 Lock roster'), start)!;
+
+    // Lobby changes after the panel exists refresh the panel itself.
+    let mark = calls.length;
+    await say(host, '/addtest 1');
+    check('panel refreshed in place when a test player is added', !!latestDash(dashId, mark) && textOf(latestDash(dashId, mark)!).includes(`${opts.extraTest + 2} interested`));
+    mark = calls.length;
+    await say(host, '/cleartest');
+    check('panel refreshed in place by /cleartest', !!latestDash(dashId, mark));
+    mark = calls.length;
+    await say(host, `/addtest ${opts.extraTest}`);
+    check('panel refreshed in place after re-adding test players', !!latestDash(dashId, mark));
+
+    mark = calls.length;
+    await tap(host, lockBtn.callback_data!, dashId);
+    const confirm = latestDash(dashId, mark)!;
+    check('lock confirm is the dashboard message edited in place', !!confirm && textOf(confirm).startsWith('🔒 Lock roster') && !calls.slice(mark).some(c => c.method === 'sendMessage'));
     const dealBtn = buttons(confirm).find(b => b.callback_data?.startsWith('ldeal_'))!;
-    await tap(host, dealBtn.callback_data!, 5);
+    mark = calls.length;
+    await tap(host, dealBtn.callback_data!, dashId);
+    const dealt = latestDash(dashId, mark);
+    check('ldeal turns the dashboard into the active dashboard', !!dealt && textOf(dealt).startsWith('📋 Game Dashboard') && buttons(dealt).some(b => b.callback_data?.startsWith('revealall_')), dealt && textOf(dealt));
+    check('ldeal sends no "Roles assigned" message to the host', !calls.slice(mark).some(c => c.method === 'sendMessage' && c.body.chat_id === 1001));
+    check('ldeal answers with a toast', !!last(c => c.method === 'answerCallbackQuery' && String(c.body.text ?? '').includes('Roles assigned'), mark));
     const lockedLobby = last(c => c.method === 'editMessageText' && textOf(c).includes('🔒 Roster locked —'), start);
     check('lobby edited with locked footer', !!lockedLobby && textOf(lockedLobby).includes(`${opts.extraTest + 1} playing`));
+    check('dashboard reveal buttons show @username', buttons(dealt!).some(b => b.text.startsWith('🎭 Reveal') && b.text.includes('(@girl)')));
 
-    // Reveal all, then read roles from the dashboard.
-    await say(host, '/dashboard');
-    const dash1 = last(c => c.method === 'sendMessage' && textOf(c).startsWith('📋 Game Dashboard'), start)!;
-    const revealAll = buttons(dash1).find(b => b.callback_data?.startsWith('revealall_'))!;
-    check('dashboard reveal buttons show @username', buttons(dash1).some(b => b.text.startsWith('🎭 Reveal') && b.text.includes('(@girl)')));
-    await tap(host, revealAll.callback_data!, 7);
+    if (opts.redash) {
+        // Host re-sends /dashboard: old message deleted, new one is live, old buttons still work but get tidied.
+        const oldId = dashId;
+        mark = calls.length;
+        await say(host, '/dashboard');
+        dashCommands++;
+        const fresh = last(c => c.method === 'sendMessage' && textOf(c).startsWith('📋 Game Dashboard'), mark)!;
+        check('/dashboard again deletes the previous dashboard message', calls.slice(mark).some(c => c.method === 'deleteMessage' && c.body.message_id === oldId));
+        dashId = fresh.messageId!;
+        const oldReveal = buttons(dealt!).find(b => b.callback_data?.startsWith('reveal_'))!;
+        mark = calls.length;
+        await tap(host, oldReveal.callback_data!, oldId);
+        check('stale dashboard button still acts, deletes itself and refreshes the current dashboard',
+            calls.slice(mark).some(c => c.method === 'deleteMessage' && c.body.message_id === oldId) && !!latestDash(dashId, mark) && !latestDash(oldId, mark));
+    } else {
+        // Single reveal updates the dashboard and a mafia player's teammates get DMed.
+        const dealtButtons = buttons(dealt!).filter(b => b.callback_data?.startsWith('reveal_'));
+        mark = calls.length;
+        await tap(host, dealtButtons[0].callback_data!, dashId);
+        const afterOne = latestDash(dashId, mark);
+        check('single reveal edits the dashboard (revealed marker)', !!afterOne && buttons(afterOne).some(b => b.text.startsWith('✅ 1.')) && textOf(afterOne).includes('Roles revealed: 1/'), afterOne && textOf(afterOne));
+        const dmWho = calls.slice(mark).filter(c => c.method === 'sendMessage' && textOf(c).startsWith('🤝')).length;
+        console.log(`  (single reveal of player 1 sent ${dmWho} teammate DM(s); test players are never messaged)`);
+    }
+
+    // Reveal all on the live dashboard, then read roles from it.
+    const dashNow = latestDash(dashId, 0) ?? dealt!;
+    const revealAll = buttons(dashNow).find(b => b.callback_data?.startsWith('revealall_'))!;
+    mark = calls.length;
+    await tap(host, revealAll.callback_data!, dashId);
     check('real player received a role photo', !!last(c => c.method === 'sendPhoto' && c.body.chat_id === 2002, start));
-    await say(host, '/dashboard');
-    const dash2 = last(c => c.method === 'sendMessage' && textOf(c).startsWith('📋 Game Dashboard'), start)!;
+    const dash2 = latestDash(dashId, mark)!;
+    check('reveal all edits the dashboard to the roster', !!dash2 && textOf(dash2).includes('Players with Roles'));
     const roster = textOf(dash2).split('\n').map(l => /^(\d+)\. (.+) - (.+?) [💚💀]$/u.exec(l)).filter(Boolean)
         .map(m => ({ order: Number(m![1]), label: m![2], role: m![3] }));
-    const elimBtn = (order: number) => buttons(dash2).find(b => b.text.startsWith(`❌ Eliminate ${order}.`))!;
     check('dashboard roster lists every player with a role', roster.length === opts.extraTest + 1, textOf(dash2));
     check('dashboard roster shows @girl', roster.some(r => r.label === 'Bea (@girl)'));
 
-    // Eliminate until the game ends.
+    // Eliminate until the game ends, all on the same message.
     const isMafia = (role: string) => role === 'Mafia' || role === 'Mafia Don';
     const targets = roster.filter(r => (opts.winner === 'Civilians' ? isMafia(r.role) : !isMafia(r.role)));
     const beforeElim = calls.length;
+    let cancelledOnce = false;
     for (const t of targets) {
         if (last(c => c.method === 'sendMessage' && textOf(c).startsWith('🏆'), beforeElim)) break;
-        const btn = elimBtn(t.order);
+        const current = latestDash(dashId, 0)!;
+        const btn = buttons(current).find(b => b.text.startsWith(`❌ Eliminate ${t.order}.`))!;
         const pid = btn.callback_data!.split('_')[2];
-        await tap(host, btn.callback_data!, 9);
-        const conf = last(c => textOf(c).startsWith('⚠️ Confirm elimination'), beforeElim)!;
-        check(`confirm shows "${t.label}"`, textOf(conf).includes(`<b>${t.label}</b>`), textOf(conf));
-        await tap(host, `eliminate_${gameId}_${pid}`, 10);
+        mark = calls.length;
+        await tap(host, btn.callback_data!, dashId);
+        const conf = latestDash(dashId, mark)!;
+        check(`confirm for "${t.label}" is the dashboard edited in place`,
+            textOf(conf) === `⚠️ Eliminate <b>${t.order}. ${t.label}</b>?` && buttons(conf).length === 2 && !calls.slice(mark).some(c => c.method === 'sendMessage'), textOf(conf));
+        if (!cancelledOnce) {
+            cancelledOnce = true;
+            const noBtn = buttons(conf).find(b => b.text.includes('No'))!;
+            mark = calls.length;
+            await tap(host, noBtn.callback_data!, dashId);
+            check('"No" sends no new message', !calls.slice(mark).some(c => c.method === 'sendMessage' || c.method === 'sendPhoto'));
+            check('"No" toasts Cancelled', !!last(c => c.method === 'answerCallbackQuery' && c.body.text === 'Cancelled', mark));
+            const back = latestDash(dashId, mark)!;
+            check('"No" restores the normal dashboard', !!back && textOf(back).startsWith('📋 Game Dashboard') && buttons(back).some(b => b.text.startsWith(`❌ Eliminate ${t.order}.`)));
+            await tap(host, btn.callback_data!, dashId);
+        }
+        mark = calls.length;
+        await tap(host, `eliminate_${gameId}_${pid}`, dashId);
         check(`"☠️ ${t.label} has been eliminated."`, !!last(c => textOf(c) === `☠️ ${t.label} has been eliminated.`, beforeElim));
+        check(`dashboard edited after eliminating "${t.label}"`, !!latestDash(dashId, mark));
     }
 
     const win = last(c => c.method === 'sendMessage' && c.body.chat_id === 1001 && textOf(c).startsWith('🏆'), beforeElim);
@@ -146,9 +214,19 @@ const scenario = async (title: string, opts: { extraTest: number; winner: 'Civil
     check('end-game summary uses labels', !!win && roster.filter(r => r.role !== 'Civilian').every(r => textOf(win).includes(`${r.label}: ${r.role}`)), win && textOf(win));
     const wonLobby = last(c => c.method === 'editMessageText' && textOf(c).includes(`${opts.winner} won!`), beforeElim);
     check('lobby edited with winner footer', !!wonLobby);
+    const finalDash = latestDash(dashId, 0)!;
+    check('final dashboard shows winner and full roster, no keyboard',
+        textOf(finalDash).includes(`${opts.winner} win!`) && roster.every(r => textOf(finalDash).includes(`${r.label} - ${r.role}`)) && buttons(finalDash).length === 0
+        && (finalDash.body.reply_markup?.inline_keyboard ?? []).length === 0, textOf(finalDash));
+    check('final dashboard marks the dead and the living', textOf(finalDash).includes('💀') && textOf(finalDash).includes('💚'));
+    check(`host sent /dashboard ${dashCommands} time(s) only`, dashCommands === (opts.redash ? 2 : 1));
 
     // Global invariants.
     const mine = calls.slice(start);
+    check('no sendMessage contains "Confirm elimination" or "Elimination cancelled"',
+        mine.every(c => c.method !== 'sendMessage' || !/Confirm elimination|Elimination cancelled/.test(textOf(c))));
+    check('the game used exactly the dashboard message(s) sent by /dashboard',
+        mine.filter(c => c.method === 'sendMessage' && c.body.chat_id === 1001 && /^(📋|🔒 Lock)/.test(textOf(c))).length === (opts.redash ? 2 : 1));
     check('no Telegram call targeted a test player (chat_id < 0)', mine.every(c => !(Number(c.body.chat_id) < 0)),
         JSON.stringify(mine.filter(c => Number(c.body.chat_id) < 0).map(c => c.method)));
     check('every text mentioning Bea shows (@girl) or (@girl_old)', mine.every(c => !/Bea/.test(textOf(c)) || /Bea \(@girl(_old)?\)/.test(textOf(c))),
@@ -161,7 +239,7 @@ const scenario = async (title: string, opts: { extraTest: number; winner: 'Civil
 
 (async () => {
     await scenario('Scenario 1: town eliminates the mafia (1 real + 3 test)', { extraTest: 3, winner: 'Civilians' });
-    await scenario('Scenario 2: mafia wins (1 real + 5 test, renamed player)', { extraTest: 5, winner: 'Mafia', staleName: true });
+    await scenario('Scenario 2: mafia wins (1 real + 5 test, renamed player, host re-sends /dashboard)', { extraTest: 5, winner: 'Mafia', staleName: true, redash: true });
     console.log(failures ? `\n${failures} assertion(s) FAILED` : '\nAll assertions PASSED');
     process.exit(failures ? 1 : 0);
 })().catch(err => {

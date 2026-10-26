@@ -75,6 +75,10 @@ export interface Game {
   lobbyInlineIds?: string[];
   winner?: string;
   cancelled?: boolean;
+  // The one live owner dashboard message (optional so older persisted state still loads).
+  // mafia: waiting phase is showing the lock/setup confirmation with this mafia count.
+  // eliminate: active phase is asking the host to confirm eliminating this player id.
+  dashboard?: { chatId: number; messageId: number; mafia?: number; eliminate?: number };
 }
 
 
@@ -309,7 +313,7 @@ export const renderPanel = (game: Game): { text: string; keyboard: Keyboard } =>
     { text: buttonLabel(`❌ Remove ${i + 1}. `, p), callback_data: `lkick_${game.id}_${p.id}` },
   ]);
   keyboard.push([{ text: '🔒 Lock & deal', callback_data: `llock_${game.id}` }]);
-  return { text: `📋 Lobby: ${gameTitle(game)} — ${n} interested\n${setup}`, keyboard };
+  return { text: `📋 Lobby: ${escapeHtml(gameTitle(game))} —${n} interested\n${setup}`, keyboard };
 };
 
 // Lock confirmation with the mafia count picker (plain text, no parse mode).
@@ -328,4 +332,63 @@ export const renderConfirm = (game: Game, mafia: number): { text: string; keyboa
       [{ text: '↩️ Back', callback_data: `lback_${game.id}` }],
     ],
   };
+};
+
+// ---------- Live dashboard (one editable owner message per game) ----------
+
+const rosterLines = (game: Game): string =>
+  game.players.map(p => `${p.order}. ${escapeHtml(playerLabel(p))} - ${p.role} ${p.isAlive ? '💚' : '💀'}`).join('\n');
+
+// Everything the owner's dashboard message shows right now. Always sent with parse_mode HTML.
+export const renderDashboard = (game: Game): { text: string; keyboard: Keyboard } => {
+  if (game.cancelled) return { text: '❌ Game cancelled.', keyboard: [] };
+  if (game.status === GAME_STATUS.WAITING) {
+    const mafia = game.dashboard?.mafia;
+    if (mafia !== undefined) {
+      const n = game.players.length;
+      if (validateSetup(n, clampMafia(n, mafia)) === null) return renderConfirm(game, mafia);
+    }
+    return renderPanel(game);
+  }
+  if (game.status === GAME_STATUS.ENDED) {
+    return { text: `🏆 <b>${escapeHtml(game.winner ?? 'Nobody')} win!</b>\n\n<b>Players with Roles:</b>\n${rosterLines(game)}`, keyboard: [] };
+  }
+  const target = game.players.find(p => p.id === game.dashboard?.eliminate && p.isAlive);
+  if (target) {
+    return {
+      text: `⚠️ Eliminate <b>${target.order}. ${escapeHtml(playerLabel(target))}</b>?`,
+      keyboard: [[
+        { text: '✅ Yes', callback_data: `eliminate_${game.id}_${target.id}` },
+        { text: '❌ No', callback_data: `elimno_${game.id}` },
+      ]],
+    };
+  }
+  const unrevealed = game.players.filter(p => !p.revealed).length;
+  let text = `📋 Game Dashboard (Status: ${game.status})`;
+  const keyboard: Keyboard = [];
+  if (unrevealed > 0) {
+    text += `\nRoles revealed: ${game.players.length - unrevealed}/${game.players.length}`;
+    keyboard.push([{ text: '🔓 Reveal All', callback_data: `revealall_${game.id}` }]);
+    game.players.forEach(p => {
+      keyboard.push([{
+        text: buttonLabel(p.revealed ? `✅ ${p.order}. ` : `🎭 Reveal ${p.order}. `, p),
+        callback_data: `reveal_${game.id}_${p.id}`,
+      }]);
+    });
+  } else {
+    text += `\n\n<b>Players with Roles:</b>\n${rosterLines(game)}`;
+    game.players.forEach(p => {
+      if (p.isAlive) keyboard.push([{ text: buttonLabel(`❌ Eliminate ${p.order}. `, p), callback_data: `eliminateconfirm_${game.id}_${p.id}` }]);
+    });
+  }
+  return { text, keyboard };
+};
+
+// DM text for a mafia player listing the others, or null when they have no teammates.
+export const teammatesText = (game: Game, player: Player): string | null => {
+  if (player.role !== ROLES.MAFIA && player.role !== ROLES.DON) return null;
+  const mates = game.players
+    .filter(p => p.id !== player.id && (p.role === ROLES.MAFIA || p.role === ROLES.DON))
+    .map(p => `${playerLabel(p)} - ${p.role}`);
+  return mates.length ? `🤝 Mafia teammates: ${mates.join(', ')}` : null;
 };
