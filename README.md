@@ -58,3 +58,28 @@ Logs: `journalctl -u mafia-bot -f`. Update: `cd ~/mafia-bot && git pull && npm c
 
 The GitHub Actions workflow in `.github/workflows/node.yml` only checks that the project builds; GitHub does not allow Actions to be used as bot hosting.
 
+## Interest lobby ("who's in?")
+
+The host announces a game days ahead; anyone can tap **I'm in** (no cap) and the message updates live. On game day the host removes no-shows, locks the roster and the bot suggests a mafia count from the real headcount. Full spec: `docs/LOBBY_SPEC.md`.
+
+- `/creategame [title]` (private chat), e.g. `/creategame Friday 20:00`. The bot replies with the lobby plus a **Share to a chat** button.
+- Or type `@your_bot Friday 20:00` in any chat (the bot does not need to be a member) and pick the result to post the lobby there.
+- Players tap **I'm in** / **Can't make it** (or send `/leave`). A player who never started the bot is sent to the bot first so it can DM their role.
+- `/dashboard` while waiting: remove players, **Lock & deal** (pick the mafia count, then deal). After that the usual reveal / eliminate flow applies.
+
+### One-time BotFather setup (required for the lobby)
+
+1. `/setinline` - choose your bot, enable inline mode, placeholder e.g. `game title, e.g. Friday 20:00`.
+2. `/setinlinefeedback` - choose your bot, set it to **Enabled** (lets the bot edit inline-posted lobbies right away; without it the bot only learns the message on the first button tap).
+
+### Cloudflare Worker webhook
+
+The webhook must receive `message`, `callback_query`, `inline_query` and `chosen_inline_result`. When (re)setting it, pass `allowed_updates` explicitly:
+
+```bash
+curl "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
+  -d "url=https://<your-worker>.workers.dev/webhook" \
+  -d "secret_token=<WEBHOOK_SECRET>" \
+  -d 'allowed_updates=["message","callback_query","inline_query","chosen_inline_result"]'
+```
+
