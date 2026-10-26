@@ -83,3 +83,14 @@ curl "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
   -d 'allowed_updates=["message","callback_query","inline_query","chosen_inline_result"]'
 ```
 
+
+## Testing with few accounts
+
+You can play a full game with just two Telegram accounts by adding fake test players (admins only):
+
+1. Find your Telegram id: send `/addtest` to the bot once, it replies with your id. Then set it: Worker `npx wrangler secret put ADMIN_IDS` (comma-separated ids), Node: `ADMIN_IDS=123456789` in `.env`.
+2. `/creategame Test night` (host account), then have the other phone tap **I'm in**.
+3. `/addtest 3` adds `🤖 Test 1..3` (`/cleartest` removes them). Test players count like normal players but are never messaged.
+4. `/dashboard` → **Lock & deal** → `/dashboard` → **Reveal All**, then play. Test players' roles are shown to the host in the dashboard and on single **Reveal**.
+
+`npm run simulate` runs the whole flow against the Worker code with a mocked Telegram API (no network, no tokens) and exits non-zero on failure.

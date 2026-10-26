@@ -9,6 +9,7 @@ import {
     ROLES,
     Role,
     Game,
+    Player,
     Keyboard,
     shuffleArray,
     generateRoles,
@@ -23,6 +24,16 @@ import {
     renderConfirm,
     suggestMafia,
     validateSetup,
+    playerLabel,
+    buttonLabel,
+    escapeHtml,
+    fullName,
+    refreshIdentity,
+    parseAdminIds,
+    clampTestCount,
+    isTestId,
+    addTestPlayers,
+    clearTestPlayers,
 } from './util';
 import path from 'path';
 dotenv.config();
@@ -37,6 +48,8 @@ const ROLE_IMAGES: Record<Role, string> = {
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const BOT_USERNAME = process.env.BOT_USERNAME;
+// Comma-separated Telegram user ids allowed to use /addtest
+const ADMIN_IDS = parseAdminIds(process.env.ADMIN_IDS);
 
 if (!BOT_TOKEN) {
     throw new Error('BOT_TOKEN is required.');
@@ -61,9 +74,19 @@ const randomizeGame = (game: Game) => {
     }));
 };
 
+// Fake test players have no Telegram chat: never message them.
+const isTest = (id: number) => isTestId(games.values(), id);
+
 // DM that must never throw (e.g. the user blocked the bot).
 const dm = (chatId: number, text: string, options?: TelegramBot.SendMessageOptions) =>
-    bot.sendMessage(chatId, text, options).catch(err => console.error('sendMessage failed:', err?.message ?? err));
+    isTest(chatId)
+        ? Promise.resolve(null)
+        : bot.sendMessage(chatId, text, options).catch(err => console.error('sendMessage failed:', err?.message ?? err));
+
+const dmPhoto = (chatId: number, photo: string, caption: string) =>
+    isTest(chatId)
+        ? Promise.resolve(null)
+        : bot.sendPhoto(chatId, photo, { caption }).catch(err => console.error('sendPhoto failed:', err?.message ?? err));
 
 // Re-renders every lobby message of a game; failed edits are logged and never break the flow.
 const refreshLobby = async (game: Game) => {
@@ -104,12 +127,12 @@ const endGame = (game: Game, winner: string) => {
     game.winner = winner;
     const activeNonCivilians = game.players
         .filter(p => p.role !== ROLES.CIVILIAN)
-        .map(p => `${p.name}: ${p.role}`)
+        .map(p => `${playerLabel(p)}: ${p.role}`)
         .join('\n');
     const message = `🏆 ${winner} win!\n\n📜 Active Roles:\n${activeNonCivilians}`;
-    bot.sendMessage(game.ownerId, message);
+    dm(game.ownerId, message);
     game.players.forEach(p => {
-        bot.sendMessage(p.id, message);
+        dm(p.id, message);
     });
     refreshLobby(game);
 };
@@ -119,7 +142,10 @@ const addInterested = async (game: Game, from: TelegramBot.User): Promise<{ ok: 
     const id = from.id;
     if (game.status !== GAME_STATUS.WAITING) return { ok: false, text: 'This game is closed.' };
     if (game.ownerId === id) return { ok: false, text: 'You\'re the host 🙂' };
-    if (game.players.some(p => p.id === id)) return { ok: false, text: 'You\'re already in ✅' };
+    if (game.players.some(p => p.id === id)) {
+        if (refreshIdentity(game, from)) await refreshLobby(game);
+        return { ok: false, text: 'You\'re already in ✅' };
+    }
     // One waiting lobby at a time; a running game blocks joining another.
     const otherId = userGames.get(id);
     const other = otherId && otherId !== game.id ? games.get(otherId) : undefined;
@@ -129,11 +155,11 @@ const addInterested = async (game: Game, from: TelegramBot.User): Promise<{ ok: 
         other.players = other.players.filter(p => p.id !== id);
         await refreshLobby(other);
     }
-    const name = from.first_name || 'Player';
-    game.players.push({ id, name, username: from.username, role: null, isAlive: true, order: game.players.length, revealed: false });
+    const player: Player = { id, name: fullName(from), username: from.username, role: null, isAlive: true, order: game.players.length, revealed: false };
+    game.players.push(player);
     userGames.set(id, game.id);
     await refreshLobby(game);
-    dm(game.ownerId, `🙋 ${name} is in (${game.players.length} interested)`);
+    dm(game.ownerId, `🙋 ${playerLabel(player)} is in (${game.players.length} interested)`);
     return { ok: true, text: 'You\'re in! ✅' };
 };
 
@@ -144,16 +170,22 @@ const removeInterested = async (game: Game, from: TelegramBot.User): Promise<str
         return inList && game.status === GAME_STATUS.ACTIVE ? 'Roster is locked — ask the host.' : 'This game is closed.';
     }
     if (!inList) return 'You weren\'t on the list.';
+    const leaver = playerLabel({ name: fullName(from), username: from.username });
     game.players = game.players.filter(p => p.id !== from.id);
     if (userGames.get(from.id) === game.id) userGames.delete(from.id);
     await refreshLobby(game);
-    dm(game.ownerId, `🙅 ${from.first_name || 'Player'} dropped out (${game.players.length} interested)`);
+    dm(game.ownerId, `🙅 ${leaver} dropped out (${game.players.length} interested)`);
     return 'Got it, you\'re out.';
 };
 
-bot.on('message', msg => {
+bot.on('message', async msg => {
     // Only a private message proves the bot can DM this user.
     if (msg.from && msg.chat.type === 'private') knownUsers.add(msg.from.id);
+    // Keep the stored name/username of the host and listed players fresh.
+    if (msg.from) {
+        const mine = games.get(userGames.get(msg.from.id) ?? '');
+        if (mine && refreshIdentity(mine, msg.from)) await refreshLobby(mine);
+    }
 });
 
 bot.onText(/\/start$/, msg => {
@@ -205,9 +237,9 @@ bot.onText(/\/creategame(?:\s+([\s\S]+))?$/, async (msg, match) => {
         }
         userGames.delete(userId);
     }
-    const name = msg.from?.first_name ?? 'admin';
+    const name = msg.from ? fullName(msg.from, 'admin') : 'admin';
     // Old "[players] [mafia]" numbers just become part of the title.
-    const game = newLobbyGame(userId, name, match?.[1]);
+    const game = newLobbyGame(userId, name, match?.[1], msg.from?.username);
     games.set(game.id, game);
     userGames.set(userId, game.id);
     const sent = await bot.sendMessage(msg.chat.id, renderLobby(game), {
@@ -281,13 +313,13 @@ bot.onText(/\/dashboard$/, msg => {
         keyboard.push([{ text: '🔓 Reveal All', callback_data: `revealall_${gameId}` }]);
         game.players.forEach(p => {
             const revealData = `reveal_${gameId}_${p.id}`;
-            keyboard.push([{ text: `🎭 Reveal ${p.order}. ${p.name}`, callback_data: revealData }]);
+            keyboard.push([{ text: buttonLabel(`🎭 Reveal ${p.order}. `, p), callback_data: revealData }]);
         });
     } else {
         game.players.forEach(p => {
             if (p.isAlive) {
                 const eliminateConfirmData = `eliminateconfirm_${gameId}_${p.id}`;
-                keyboard.push([{ text: `❌ Eliminate ${p.order}. ${p.name}`, callback_data: eliminateConfirmData }]);
+                keyboard.push([{ text: buttonLabel(`❌ Eliminate ${p.order}. `, p), callback_data: eliminateConfirmData }]);
             }
         });
     }
@@ -298,10 +330,44 @@ bot.onText(/\/dashboard$/, msg => {
     if (!anyUnrevealed && game.status === GAME_STATUS.ACTIVE) {
         dashboardText += '\n\n<b>Players with Roles:</b>';
         game.players.forEach(p => {
-            dashboardText += `\n${p.order}. ${p.name} - ${p.role} ${p.isAlive ? '💚' : '💀'}`;
+            dashboardText += `\n${p.order}. ${escapeHtml(playerLabel(p))} - ${p.role} ${p.isAlive ? '💚' : '💀'}`;
         });
     }
     bot.sendMessage(msg.chat.id, dashboardText, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
+});
+
+// Admin-only: add or remove fake players in the host's waiting lobby.
+const testPlayers = async (msg: TelegramBot.Message, action: 'add' | 'clear', countText?: string) => {
+    const userId = msg.from?.id;
+    const chatId = msg.chat.id;
+    if (!userId) return;
+    if (msg.chat.type !== 'private') return bot.sendMessage(chatId, '❌ Use this command in a private chat with the bot.');
+    if (!ADMIN_IDS.has(userId)) {
+        return bot.sendMessage(chatId, `❌ Test mode is for admins. Your Telegram id is ${userId} — add it to ADMIN_IDS to enable.`);
+    }
+    const game = games.get(userGames.get(userId) ?? '');
+    if (!game || game.ownerId !== userId || game.status === GAME_STATUS.ENDED) {
+        return bot.sendMessage(chatId, '❌ Create a game first with /creategame.');
+    }
+    if (game.status !== GAME_STATUS.WAITING) return bot.sendMessage(chatId, '❌ Test players can only be changed while the lobby is open.');
+    if (action === 'add') {
+        const n = clampTestCount(countText);
+        addTestPlayers(game, n, games.values());
+        await refreshLobby(game);
+        bot.sendMessage(chatId, `🤖 Added ${n} test players (${game.players.length} interested)`);
+    } else {
+        const removed = clearTestPlayers(game);
+        await refreshLobby(game);
+        bot.sendMessage(chatId, `🤖 Removed ${removed} test players (${game.players.length} interested)`);
+    }
+};
+
+bot.onText(/\/addtest(?:\s+(\S+))?$/, (msg, match) => {
+    testPlayers(msg, 'add', match?.[1]);
+});
+
+bot.onText(/\/cleartest$/, msg => {
+    testPlayers(msg, 'clear');
 });
 
 // Inline mode: `@bot <title or gameId>` offers the host's lobby to post anywhere.
@@ -314,7 +380,7 @@ bot.on('inline_query', async q => {
     } else if (!game) {
         const existing = games.get(userGames.get(from.id) ?? '');
         if (!existing || existing.status === GAME_STATUS.ENDED) {
-            game = newLobbyGame(from.id, from.first_name ?? 'admin', text);
+            game = newLobbyGame(from.id, fullName(from, 'admin'), text, from.username);
             games.set(game.id, game);
             userGames.set(from.id, game.id);
         }
@@ -362,6 +428,7 @@ bot.on('callback_query', async cb => {
     const gameId = parts[1];
     const userIdStr = parts[2];
     const game = games.get(gameId);
+    if (game && refreshIdentity(game, cb.from)) await refreshLobby(game);
     if (!game) return bot.answerCallbackQuery(cb.id, action.startsWith('l') ? { text: 'This game is closed.' } : undefined);
     // Fallback capture of an inline-posted lobby in case chosen_inline_result is not enabled.
     addInlineId(game, cb.inline_message_id);
@@ -431,10 +498,10 @@ bot.on('callback_query', async cb => {
                 } catch {
                 }
             }
-            const sentMsg = await bot.sendPhoto(cb.message!.chat.id, roleImage, { caption: `🎭 ${player.name} is ${player.role}` });
+            const sentMsg = await bot.sendPhoto(cb.message!.chat.id, roleImage, { caption: `🎭 ${playerLabel(player)} is ${player.role}` });
             game.lastRevealChatId = sentMsg.chat.id;
             game.lastRevealMessageId = sentMsg.message_id;
-            await bot.sendPhoto(player.id, roleImage, { caption: `🎭 Your role is ${player.role}` });
+            await dmPhoto(player.id, roleImage, `🎭 Your role is ${player.role}`);
             bot.answerCallbackQuery(cb.id);
             break;
         }
@@ -457,7 +524,7 @@ bot.on('callback_query', async cb => {
             await Promise.all(
                 unrevealed.map(p => {
                     if (!p.role) return Promise.resolve();
-                    return bot.sendPhoto(p.id, ROLE_IMAGES[p.role], { caption: `🎭 Your role is ${p.role}` });
+                    return dmPhoto(p.id, ROLE_IMAGES[p.role], `🎭 Your role is ${p.role}`);
                 })
             );
 
@@ -469,14 +536,10 @@ bot.on('callback_query', async cb => {
                     const teammates = mafiaPlayers
                         .filter(p => p.id !== player.id)
                         .map(
-                            p =>
-                                `${p.name}${p.username ? ` (@${p.username})` : ''} - ${p.role}`,
+                            p => `${playerLabel(p)} - ${p.role}`,
                         )
                         .join(', ');
-                    return bot.sendMessage(
-                        player.id,
-                        `🤝 Mafia teammates: ${teammates}`,
-                    );
+                    return dm(player.id, `🤝 Mafia teammates: ${teammates}`);
                 }),
             );
 
@@ -493,7 +556,8 @@ bot.on('callback_query', async cb => {
                     { text: '❌ No', callback_data: `cancel_${gameId}` }
                 ]]
             };
-            const playerName = game.players.find(p => p.id === targetId)?.name;
+            const target = game.players.find(p => p.id === targetId);
+            const playerName = target ? escapeHtml(playerLabel(target)) : 'player';
             bot.sendMessage(cb.message!.chat.id, `⚠️ Confirm elimination of <b>${playerName}</b>?`, { parse_mode: 'HTML', reply_markup: confirmKeyboard });
             bot.answerCallbackQuery(cb.id);
             break;
@@ -504,7 +568,7 @@ bot.on('callback_query', async cb => {
             const player = game.players.find(p => p.id === targetId);
             if (!player || !player.isAlive) return;
             player.isAlive = false;
-            bot.sendMessage(cb.message!.chat.id, `☠️ ${player.name} has been eliminated.`);
+            bot.sendMessage(cb.message!.chat.id, `☠️ ${playerLabel(player)} has been eliminated.`);
             bot.answerCallbackQuery(cb.id);
             const winner = checkWinCondition(game);
             if (winner) endGame(game, winner);

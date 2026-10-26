@@ -41,7 +41,8 @@ export const OWNER_HELP_TEXT =
   'Single command to manage whole game (remove players, lock & deal, reveal roles):\n/dashboard\n' +
   '\nAdvanced commands:\n' +
   '/startgame - lock the roster and deal roles\n' +
-  '/abortgame - cancel your current game';
+  '/abortgame - cancel your current game\n' +
+  '(admins) /addtest n, /cleartest - add or remove fake test players while the lobby is open';
 
 
 export interface Player {
@@ -52,12 +53,15 @@ export interface Player {
   isAlive: boolean;
   order: number;
   revealed: boolean;
+  // Fake player added with /addtest: never messaged, id is negative
+  isTest?: boolean;
 }
 
 export interface Game {
   id: string;
   ownerId: number;
   ownerName: string;
+  ownerUsername?: string;
   players: Player[];
   maxPlayers: number;
   maxMafia: number;
@@ -131,6 +135,83 @@ export const cleanTitle = (text: string | undefined | null): string =>
 export const playerLabel = (p: { name: string; username?: string }): string =>
   p.username ? `${p.name} (@${p.username})` : p.name;
 
+interface TgUser { id: number; first_name?: string; last_name?: string; username?: string }
+
+// Telegram first + last name, or the fallback when both are missing.
+export const fullName = (from: { first_name?: string; last_name?: string }, fallback = 'Player'): string =>
+  [from.first_name, from.last_name].filter(Boolean).join(' ') || fallback;
+
+// Inline-button text: prefix + "Name (@username)", name truncated with … when too long.
+export const buttonLabel = (prefix: string, p: { name: string; username?: string }, max = 40): string => {
+  const suffix = p.username ? ` (@${p.username})` : '';
+  const room = Math.max(2, max - prefix.length - suffix.length);
+  const chars = Array.from(p.name);
+  const name = chars.length > room ? chars.slice(0, room - 1).join('') + '…' : p.name;
+  return `${prefix}${name}${suffix}`;
+};
+
+export const ownerLabel = (game: Game): string =>
+  playerLabel({ name: game.ownerName, username: game.ownerUsername });
+
+// Updates the stored name/username of the owner and of a listed player from the latest `from`.
+export const refreshIdentity = (game: Game, from: TgUser | undefined): boolean => {
+  if (!from) return false;
+  let changed = false;
+  const name = fullName(from, '');
+  if (game.ownerId === from.id) {
+    if (name && game.ownerName !== name) { game.ownerName = name; changed = true; }
+    if (game.ownerUsername !== from.username) { game.ownerUsername = from.username; changed = true; }
+  }
+  const p = game.players.find(x => x.id === from.id);
+  if (p) {
+    if (name && p.name !== name) { p.name = name; changed = true; }
+    if (p.username !== from.username) { p.username = from.username; changed = true; }
+  }
+  return changed;
+};
+
+// ---------- Test players (admin-only, for trying the game with few accounts) ----------
+
+export const parseAdminIds = (raw: string | undefined | null): Set<number> =>
+  new Set((raw ?? '').split(',').map(s => Number(s.trim())).filter(n => Number.isInteger(n) && n !== 0));
+
+export const clampTestCount = (text: string | undefined | null): number => {
+  const n = parseInt(text ?? '', 10);
+  return Math.min(12, Math.max(1, Number.isNaN(n) ? 1 : n));
+};
+
+// True when the id belongs to a fake player in any game (such ids must never be messaged).
+export const isTestId = (games: Iterable<Game>, id: number): boolean => {
+  for (const g of games) if (g.players.some(p => p.id === id && p.isTest)) return true;
+  return false;
+};
+
+export const addTestPlayers = (game: Game, count: number, allGames: Iterable<Game>): void => {
+  const taken = new Set<number>();
+  for (const g of [game, ...allGames]) g.players.forEach(p => taken.add(p.id));
+  let seq = Math.max(0, ...game.players.filter(p => p.isTest).map(p => Number(/(\d+)$/.exec(p.name)?.[1] ?? 0)));
+  let id = -(Date.now() % 1e9) - 1;
+  for (let i = 0; i < count; i++) {
+    while (taken.has(id)) id--;
+    taken.add(id);
+    game.players.push({
+      id,
+      name: `🤖 Test ${++seq}`,
+      role: null,
+      isAlive: true,
+      order: game.players.length,
+      revealed: false,
+      isTest: true,
+    });
+  }
+};
+
+export const clearTestPlayers = (game: Game): number => {
+  const before = game.players.length;
+  game.players = game.players.filter(p => !p.isTest);
+  return before - game.players.length;
+};
+
 // Mafia count suggested for a headcount.
 export const suggestMafia = (players: number): number => {
   if (players >= 14) return 4;
@@ -171,7 +252,7 @@ export const renderLobby = (game: Game): string => {
   const list = game.players.length
     ? game.players.map((p, i) => `${i + 1}. ${escapeHtml(playerLabel(p))}`).join('\n')
     : 'Nobody yet — be the first!';
-  let text = `🎭 <b>${escapeHtml(gameTitle(game))}</b>\nHost: ${escapeHtml(game.ownerName)}\n\n` +
+  let text = `🎭 <b>${escapeHtml(gameTitle(game))}</b>\nHost: ${escapeHtml(ownerLabel(game))}\n\n` +
     `🙋 Interested: ${game.players.length}\n${list}`;
   const footer = lobbyFooter(game);
   if (footer) text += `\n\n${footer}`;
@@ -188,10 +269,16 @@ export const lobbyKeyboard = (game: Game, share = false): Keyboard => {
   return keyboard;
 };
 
-export const newLobbyGame = (ownerId: number, ownerName: string, title?: string | null): Game => ({
+export const newLobbyGame = (
+  ownerId: number,
+  ownerName: string,
+  title?: string | null,
+  ownerUsername?: string,
+): Game => ({
   id: Date.now().toString(),
   ownerId,
   ownerName,
+  ownerUsername,
   players: [],
   maxPlayers: 0,
   maxMafia: 0,
@@ -219,7 +306,7 @@ export const renderPanel = (game: Game): { text: string; keyboard: Keyboard } =>
     : `Suggested setup: ${n} players, ${suggestMafia(n)} mafia (Don + ${suggestMafia(n) - 1})`;
   // Telegram allows at most 100 buttons per message.
   const keyboard: Keyboard = game.players.slice(0, 90).map((p, i) => [
-    { text: `❌ Remove ${i + 1}. ${p.name}`, callback_data: `lkick_${game.id}_${p.id}` },
+    { text: buttonLabel(`❌ Remove ${i + 1}. `, p), callback_data: `lkick_${game.id}_${p.id}` },
   ]);
   keyboard.push([{ text: '🔒 Lock & deal', callback_data: `llock_${game.id}` }]);
   return { text: `📋 Lobby: ${gameTitle(game)} — ${n} interested\n${setup}`, keyboard };

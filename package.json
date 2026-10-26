@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "ts-node src/mafia-bot.ts",
     "build": "tsc",
-    "start": "node dist/mafia-bot.js"
+    "start": "node dist/mafia-bot.js",
+    "simulate": "ts-node --project scripts/tsconfig.json scripts/simulate.ts"
   },
   "keywords": [],
   "author": "",

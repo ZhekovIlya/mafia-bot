@@ -23,12 +23,24 @@ import {
     renderConfirm,
     suggestMafia,
     validateSetup,
+    playerLabel,
+    buttonLabel,
+    escapeHtml,
+    fullName,
+    refreshIdentity,
+    parseAdminIds,
+    clampTestCount,
+    isTestId,
+    addTestPlayers,
+    clearTestPlayers,
 } from '../src/util';
 
 interface Env {
     BOT_TOKEN: string;
     BOT_USERNAME: string;
     WEBHOOK_SECRET: string;
+    // Comma-separated Telegram user ids allowed to use /addtest (set with `wrangler secret put ADMIN_IDS`)
+    ADMIN_IDS?: string;
     GAMES: DurableObjectNamespace;
 }
 
@@ -115,11 +127,18 @@ export class Games {
         }
     }
 
-    private send(chatId: number, text: string, extra: Record<string, unknown> = {}) {
+    // Fake test players have no Telegram chat: never message them.
+    private isTest(id: number) {
+        return isTestId(this.games.values(), id);
+    }
+
+    private async send(chatId: number, text: string, extra: Record<string, unknown> = {}) {
+        if (this.isTest(chatId)) return null;
         return this.tg('sendMessage', { chat_id: chatId, text, ...extra });
     }
 
-    private sendPhoto(chatId: number, photo: string, caption: string) {
+    private async sendPhoto(chatId: number, photo: string, caption: string) {
+        if (this.isTest(chatId)) return null;
         return this.tg('sendPhoto', { chat_id: chatId, photo, caption });
     }
 
@@ -176,7 +195,7 @@ export class Games {
         game.winner = winner;
         const activeNonCivilians = game.players
             .filter(p => p.role !== ROLES.CIVILIAN)
-            .map(p => `${p.name}: ${p.role}`)
+            .map(p => `${playerLabel(p)}: ${p.role}`)
             .join('\n');
         const message = `🏆 ${winner} win!\n\n📜 Active Roles:\n${activeNonCivilians}`;
         await Promise.all([game.ownerId, ...game.players.map(p => p.id)].map(id => this.send(id, message)));
@@ -191,6 +210,11 @@ export class Games {
 
         // Only a private message proves the bot can DM this user.
         if (userId && msg.chat.type === 'private') this.users.add(userId);
+        // Keep the stored name/username of the host and listed players fresh.
+        if (userId) {
+            const mine = this.games.get(this.userGames.get(userId) ?? '');
+            if (mine && refreshIdentity(mine, msg.from)) await this.refreshLobby(mine);
+        }
 
         if (/\/start$/.test(text)) {
             await this.send(chatId, START_HINT);
@@ -219,6 +243,36 @@ export class Games {
             await this.send(chatId, view.text, { reply_markup: { inline_keyboard: view.keyboard } });
         } else if (/\/dashboard$/.test(text)) {
             await this.dashboard(chatId, userId);
+        } else if ((match = /\/addtest(?:\s+(\S+))?$/.exec(text))) {
+            await this.testPlayers(msg, 'add', match[1]);
+        } else if (/\/cleartest$/.test(text)) {
+            await this.testPlayers(msg, 'clear');
+        }
+    }
+
+    // Admin-only: add or remove fake players in the host's waiting lobby.
+    private async testPlayers(msg: any, action: 'add' | 'clear', countText?: string) {
+        const userId: number | undefined = msg.from?.id;
+        const chatId: number = msg.chat.id;
+        if (!userId) return;
+        if (msg.chat.type !== 'private') return this.send(chatId, '❌ Use this command in a private chat with the bot.');
+        if (!parseAdminIds(this.env.ADMIN_IDS).has(userId)) {
+            return this.send(chatId, `❌ Test mode is for admins. Your Telegram id is ${userId} — add it to ADMIN_IDS to enable.`);
+        }
+        const game = this.games.get(this.userGames.get(userId) ?? '');
+        if (!game || game.ownerId !== userId || game.status === GAME_STATUS.ENDED) {
+            return this.send(chatId, '❌ Create a game first with /creategame.');
+        }
+        if (game.status !== GAME_STATUS.WAITING) return this.send(chatId, '❌ Test players can only be changed while the lobby is open.');
+        if (action === 'add') {
+            const n = clampTestCount(countText);
+            addTestPlayers(game, n, this.games.values());
+            await this.refreshLobby(game);
+            await this.send(chatId, `🤖 Added ${n} test players (${game.players.length} interested)`);
+        } else {
+            const removed = clearTestPlayers(game);
+            await this.refreshLobby(game);
+            await this.send(chatId, `🤖 Removed ${removed} test players (${game.players.length} interested)`);
         }
     }
 
@@ -253,7 +307,7 @@ export class Games {
             this.userGames.delete(userId);
         }
         // Old "[players] [mafia]" numbers just become part of the title.
-        const game = newLobbyGame(userId, msg.from?.first_name ?? 'admin', titleText);
+        const game = newLobbyGame(userId, msg.from ? fullName(msg.from, 'admin') : 'admin', titleText, msg.from?.username);
         this.games.set(game.id, game);
         this.userGames.set(userId, game.id);
         const sent = await this.send(chatId, renderLobby(game), {
@@ -269,7 +323,10 @@ export class Games {
         const id: number = from.id;
         if (game.status !== GAME_STATUS.WAITING) return { ok: false, text: 'This game is closed.' };
         if (game.ownerId === id) return { ok: false, text: 'You\'re the host 🙂' };
-        if (game.players.some(p => p.id === id)) return { ok: false, text: 'You\'re already in ✅' };
+        if (game.players.some(p => p.id === id)) {
+            if (refreshIdentity(game, from)) await this.refreshLobby(game);
+            return { ok: false, text: 'You\'re already in ✅' };
+        }
         // One waiting lobby at a time; a running game blocks joining another.
         const otherId = this.userGames.get(id);
         const other = otherId && otherId !== game.id ? this.games.get(otherId) : undefined;
@@ -279,18 +336,19 @@ export class Games {
             other.players = other.players.filter(p => p.id !== id);
             await this.refreshLobby(other);
         }
-        game.players.push({
+        const player = {
             id,
-            name: from.first_name || 'Player',
+            name: fullName(from),
             username: from.username,
             role: null,
             isAlive: true,
             order: game.players.length,
             revealed: false,
-        });
+        };
+        game.players.push(player);
         this.userGames.set(id, game.id);
         await this.refreshLobby(game);
-        await this.send(game.ownerId, `🙋 ${from.first_name || 'Player'} is in (${game.players.length} interested)`);
+        await this.send(game.ownerId, `🙋 ${playerLabel(player)} is in (${game.players.length} interested)`);
         return { ok: true, text: 'You\'re in! ✅' };
     }
 
@@ -303,10 +361,11 @@ export class Games {
                 : 'This game is closed.';
         }
         if (!inList) return 'You weren\'t on the list.';
+        const leaver = playerLabel({ name: fullName(from), username: from.username });
         game.players = game.players.filter(p => p.id !== from.id);
         if (this.userGames.get(from.id) === game.id) this.userGames.delete(from.id);
         await this.refreshLobby(game);
-        await this.send(game.ownerId, `🙅 ${from.first_name || 'Player'} dropped out (${game.players.length} interested)`);
+        await this.send(game.ownerId, `🙅 ${leaver} dropped out (${game.players.length} interested)`);
         return 'Got it, you\'re out.';
     }
 
@@ -347,12 +406,12 @@ export class Games {
         if (anyUnrevealed) {
             keyboard.push([{ text: '🔓 Reveal All', callback_data: `revealall_${gameId}` }]);
             game.players.forEach(p => {
-                keyboard.push([{ text: `🎭 Reveal ${p.order}. ${p.name}`, callback_data: `reveal_${gameId}_${p.id}` }]);
+                keyboard.push([{ text: buttonLabel(`🎭 Reveal ${p.order}. `, p), callback_data: `reveal_${gameId}_${p.id}` }]);
             });
         } else {
             game.players.forEach(p => {
                 if (p.isAlive) {
-                    keyboard.push([{ text: `❌ Eliminate ${p.order}. ${p.name}`, callback_data: `eliminateconfirm_${gameId}_${p.id}` }]);
+                    keyboard.push([{ text: buttonLabel(`❌ Eliminate ${p.order}. `, p), callback_data: `eliminateconfirm_${gameId}_${p.id}` }]);
                 }
             });
         }
@@ -361,7 +420,7 @@ export class Games {
         if (!anyUnrevealed && game.status === GAME_STATUS.ACTIVE) {
             dashboardText += '\n\n<b>Players with Roles:</b>';
             game.players.forEach(p => {
-                dashboardText += `\n${p.order}. ${p.name} - ${p.role} ${p.isAlive ? '💚' : '💀'}`;
+                dashboardText += `\n${p.order}. ${escapeHtml(playerLabel(p))} - ${p.role} ${p.isAlive ? '💚' : '💀'}`;
             });
         }
         await this.send(chatId, dashboardText, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
@@ -384,7 +443,7 @@ export class Games {
         } else if (!game) {
             const existing = this.games.get(this.userGames.get(from.id) ?? '');
             if (!existing || existing.status === GAME_STATUS.ENDED) {
-                game = newLobbyGame(from.id, from.first_name ?? 'admin', text);
+                game = newLobbyGame(from.id, fullName(from, 'admin'), text, from.username);
                 this.games.set(game.id, game);
                 this.userGames.set(from.id, game.id);
             }
@@ -434,6 +493,7 @@ export class Games {
         // Fallback capture of an inline-posted lobby in case chosen_inline_result is not enabled.
         if (cb.inline_message_id) this.addInlineId(game, cb.inline_message_id);
         const chatId: number | undefined = cb.message?.chat.id;
+        if (refreshIdentity(game, cb.from)) await this.refreshLobby(game);
         const isOwner = game.ownerId === cb.from.id;
         const waiting = game.status === GAME_STATUS.WAITING;
         switch (action) {
@@ -489,7 +549,7 @@ export class Games {
                 if (!player || !player.role) return;
                 player.revealed = true;
                 await this.deleteLastReveal(game);
-                const sentMsg = await this.sendPhoto(chatId!, ROLE_IMAGES[player.role], `🎭 ${player.name} is ${player.role}`);
+                const sentMsg = await this.sendPhoto(chatId!, ROLE_IMAGES[player.role], `🎭 ${playerLabel(player)} is ${player.role}`);
                 if (sentMsg) {
                     game.lastRevealChatId = sentMsg.chat.id;
                     game.lastRevealMessageId = sentMsg.message_id;
@@ -509,7 +569,7 @@ export class Games {
                 await Promise.all(mafiaPlayers.map(player => {
                     const teammates = mafiaPlayers
                         .filter(p => p.id !== player.id)
-                        .map(p => `${p.name}${p.username ? ` (@${p.username})` : ''} - ${p.role}`)
+                        .map(p => `${playerLabel(p)} - ${p.role}`)
                         .join(', ');
                     return this.send(player.id, `🤝 Mafia teammates: ${teammates}`);
                 }));
@@ -519,7 +579,8 @@ export class Games {
             case 'eliminateconfirm': {
                 if (!isOwner) return this.answer(cb.id, MESSAGES.NOT_AUTHORIZED);
                 const targetId = Number(userIdStr);
-                const playerName = game.players.find(p => p.id === targetId)?.name;
+                const target = game.players.find(p => p.id === targetId);
+                const playerName = target ? escapeHtml(playerLabel(target)) : 'player';
                 await this.send(chatId!, `⚠️ Confirm elimination of <b>${playerName}</b>?`, {
                     parse_mode: 'HTML',
                     reply_markup: { inline_keyboard: [[
@@ -534,7 +595,7 @@ export class Games {
                 const player = game.players.find(p => p.id === Number(userIdStr));
                 if (!player || !player.isAlive) return;
                 player.isAlive = false;
-                await this.send(chatId!, `☠️ ${player.name} has been eliminated.`);
+                await this.send(chatId!, `☠️ ${playerLabel(player)} has been eliminated.`);
                 await this.answer(cb.id);
                 const winner = checkWinCondition(game);
                 if (winner) await this.endGame(game, winner);

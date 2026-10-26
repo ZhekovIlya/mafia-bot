@@ -96,3 +96,16 @@ In @BotFather: `/setinline` (enable, placeholder e.g. `game title, e.g. Friday 2
 
 ## Out of scope
 Broadcast, night actions, undo elimination, teammate-message fix, anything else.
+
+## Addendum: names and test players
+
+### Names
+- Display name is `first_name` + ` last_name` (when present); `username` is stored separately. Every user-facing mention uses `playerLabel`: `Name (@username)`, or `Name` without a username (lobby list and host line, panel buttons, owner DMs, dashboard roster and buttons, reveal caption, elimination messages, end-game roles, mafia teammates).
+- `Game.ownerUsername` (optional) is set on create. Stored name/username of the host and listed players are refreshed from the latest `from` on any message or callback.
+- Inline button text is capped at ~40 chars: the name is truncated with `…`, the `(@username)` stays intact. HTML messages escape the label.
+
+### Test players (admin-only)
+- `ADMIN_IDS` env var (comma-separated Telegram ids; Worker secret, Node `.env`).
+- `/addtest [n]` (private chat, host of a `waiting` game, id in `ADMIN_IDS`; n defaults to 1, clamped 1..12) adds `🤖 Test N` players with unique negative ids and `isTest: true`. `/cleartest` removes them. Non-admins get `❌ Test mode is for admins. Your Telegram id is <id> — add it to ADMIN_IDS to enable.`; admins without a waiting game get `❌ Create a game first with /creategame.`
+- Test players are not in `userGames` or known users, otherwise behave like real players (lobby count, remove, deal, reveal, eliminate, win check, summaries). Nothing is ever sent to them (single guard in `send`/`sendPhoto`); the host still gets reveal captions.
+- `npm run simulate` (`scripts/simulate.ts`) drives the Durable Object end to end with a mocked Telegram API.
